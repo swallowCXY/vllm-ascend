@@ -24,6 +24,8 @@ from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request
 from vllm.v1.serial_utils import MsgpackEncoder
 
+from vllm_ascend import envs as ascend_envs
+from vllm_ascend.core.kv_cache_control_manager import KVCacheControlManager
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.backend import (
     backend_map,
 )
@@ -98,6 +100,9 @@ class KVPoolScheduler:
         )
         # request_id -> (vllm cached tokes, kvpool cached tokens)
         self.load_specs: dict[str, LoadSpec] = {}
+        self.kv_cache_control = (
+            KVCacheControlManager() if ascend_envs.VLLM_ASCEND_KV_CACHE_CONTROL else None
+        )
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
@@ -182,6 +187,9 @@ class KVPoolScheduler:
         self.keys_per_block_hash = keys_per_block_hash
 
         self.client: LookupKeyClient | None = None
+
+    def _is_no_store_request(self, request: "Request") -> bool:
+        return self.kv_cache_control is not None and self.kv_cache_control.is_no_store(request)
 
     def _get_or_create_request_tracker(self, req_id: str) -> RequestTracker:
         tracker = self._request_trackers.get(req_id)
@@ -941,6 +949,9 @@ class KVPoolScheduler:
         )
 
         for request in scheduler_output.scheduled_new_reqs:
+            if self._is_no_store_request(request):
+                logger.debug("KV pool store skipped for no-store request %s", request.request_id)
+                continue
             req_meta = self._process_new_request(request, scheduler_output, force_skip_save)
             if req_meta is not None:
                 self.touch_sending_mamba_blocks(req_meta)
@@ -951,6 +962,10 @@ class KVPoolScheduler:
             for i, req_id in enumerate(cached_reqs.req_ids):
                 new_block_ids = cached_reqs.new_block_ids[i]
                 if not new_block_ids:
+                    continue
+                tracked = self._unfinished_requests.get(req_id)
+                if tracked is not None and self._is_no_store_request(tracked[0]):
+                    logger.debug("KV pool store skipped for no-store request %s", req_id)
                     continue
                 if req_id in self._preempted_req_ids:
                     req_meta = self._process_preempted_cached_request(
@@ -1044,6 +1059,9 @@ class KVPoolScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        if self._is_no_store_request(request):
+            self._delayed_free_req_ids.discard(request.request_id)
+            return False, None
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None
@@ -1068,6 +1086,9 @@ class KVPoolScheduler:
         block_ids: tuple[list[int], ...],
     ) -> tuple[bool, dict[str, Any] | None]:
         """HMA path for hybrid KV cache groups."""
+        if self._is_no_store_request(request):
+            self._delayed_free_req_ids.discard(request.request_id)
+            return False, None
         if self.kv_role == "kv_consumer" and not self.consumer_is_to_put:
             self._delayed_free_req_ids.discard(request.request_id)
             return False, None

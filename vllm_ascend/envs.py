@@ -110,6 +110,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to enable request-level KV cache lifecycle control
+    # (KVCacheControlManager). When enabled, a request carrying
+    # kv_transfer_params={"kv_cache_control": {"mode": "no_store"}} will have
+    # its newly produced KV blocks excluded from prefix caching and external
+    # KV pool stores. Requests without the declaration are unaffected.
+    # 0: disable; 1: enable (default).
+    "VLLM_ASCEND_KV_CACHE_CONTROL": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_CACHE_CONTROL", "1"))),
 }
 
 # end-env-vars-definition
