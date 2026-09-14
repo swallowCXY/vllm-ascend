@@ -117,6 +117,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # KV pool stores. Requests without the declaration are unaffected.
     # 0: disable; 1: enable (default).
     "VLLM_ASCEND_KV_CACHE_CONTROL": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_CACHE_CONTROL", "1"))),
+    # Upper bound of prefix-cache blocks protected by pin / unexpired TTL
+    # entries, as a fraction of total GPU KV blocks. Declarations exceeding
+    # the budget degrade to normal caching with a warning.
+    # Valid range: (0, 1); default 0.25.
+    "VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO": lambda: float(os.getenv("VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO", "0.25")),
 }
 
 # end-env-vars-definition

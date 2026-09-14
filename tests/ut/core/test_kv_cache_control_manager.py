@@ -54,13 +54,6 @@ class TestParseRequestControl:
         assert kvcm.is_no_store(req) is False
         assert kvcm.metrics["unsupported_requests"] == 1
 
-    def test_unsupported_modes_ignored(self):
-        kvcm = KVCacheControlManager()
-        for mode in ("pin", "ttl"):
-            req = _request({"kv_cache_control": {"mode": mode, "ttl_s": 60}})
-            assert kvcm.is_no_store(req) is False
-        assert kvcm.metrics["unsupported_requests"] == 2
-
     @pytest.mark.parametrize(
         "payload",
         [
@@ -97,18 +90,29 @@ class TestParseRequestControl:
         assert first is second
         assert kvcm.metrics["no_store_requests"] == 1
 
+    def test_pin_ttl_modes_parse(self):
+        kvcm = KVCacheControlManager()
+        pin_req = _request({"kv_cache_control": {"mode": "pin", "cache_key": "k", "priority": 3}})
+        control = kvcm.parse_request_control(pin_req)
+        assert control["mode"] == "pin" and control["priority"] == 3
+        assert kvcm.metrics["pin_requests"] == 1
+        ttl_req = _request({"kv_cache_control": {"mode": "ttl", "cache_key": "k", "ttl_s": 60}})
+        control = kvcm.parse_request_control(ttl_req)
+        assert control["mode"] == "ttl" and control["ttl_s"] == 60
+        assert kvcm.metrics["ttl_requests"] == 1
+
+    def test_pin_without_cache_key_is_parse_error(self):
+        kvcm = KVCacheControlManager()
+        assert kvcm.parse_request_control(_request({"kv_cache_control": {"mode": "pin"}})) is None
+        assert kvcm.metrics["parse_errors"] == 1
+
+    def test_ttl_without_ttl_s_is_parse_error(self):
+        kvcm = KVCacheControlManager()
+        assert kvcm.parse_request_control(_request({"kv_cache_control": {"mode": "ttl", "cache_key": "k"}})) is None
+        assert kvcm.metrics["parse_errors"] == 1
+
 
 class TestInterfaceStubs:
-    def test_stubs_raise_not_implemented(self):
-        kvcm = KVCacheControlManager()
-        ref = ContentRef(cache_key="kb:doc:1")
-        with pytest.raises(NotImplementedError):
-            kvcm.pin(ref, priority=1, ttl_s=60)
-        with pytest.raises(NotImplementedError):
-            kvcm.set_ttl(ref, 60)
-        with pytest.raises(NotImplementedError):
-            kvcm.release(ref)
-
     def test_content_ref_and_pin_handle(self):
         ref = ContentRef(namespace="ns", cache_key="k", prefix_tokens=137)
         assert ref.prefix_tokens == 137

@@ -43,7 +43,7 @@ Agent 场景对 KV cache 生命周期提出了当前 vLLM prefix caching（纯 L
 |   <--- connector metadata 扩展: TTL/pin/no-store 透传外部存储    |
 +---------------------------------------------------------------+
         ^                                    ^
-        |  请求级声明 (extra_body, 随请求流动)   |  控制面 RPC (pin/release/set_ttl)
+        |  请求级声明 (kv_transfer_params, 随请求流动)   |  控制面 RPC (pin/release/set_ttl)
    Agent / API server <------------------------+
 ```
 
@@ -141,13 +141,13 @@ class KVCacheControlManager:
 
 ### 4.2 Agent 实际调用形态
 
-**请求级声明（首选，随请求原子生效，无竞态）**——通过 OpenAI 兼容层 `extra_body`：
+**请求级声明（首选，随请求原子生效，无竞态）**——通过 OpenAI 兼容层请求体的顶层字段 `kv_transfer_params`（OpenAI SDK 客户端可用 `extra_body` 等价透传，SDK 会将其合并进顶层 body）：
 
 ```jsonc
 POST /v1/chat/completions
 {
   "messages": [...],
-  "extra_body": {
+  "kv_transfer_params": {
     "kv_cache_control": {
       "mode": "no_store"                      // 本请求内容不入缓存
       // "mode": "pin",  "priority": 10, "ttl_s": 86400
@@ -299,11 +299,11 @@ chunked prefill 将长请求拆成多个调度步，每步的 `allocate_slots`/`
                                             ↑ 头部块已注册，no-store 只能部分生效
 ```
 
-请求级声明（extra_body 随 Request 对象）在首次 `schedule()` 前即被 `on_request_scheduled` 读取，无窗口。缓解手段：请求级优先；控制面标注 best-effort；可选硬化——KCCM 记录该请求已注册的哈希集合，晚到命令触发"追补注销"（跳过共享块）。
+请求级声明（顶层 `kv_transfer_params` 随 Request 对象）在首次 `schedule()` 前即被 `on_request_scheduled` 读取，无窗口。缓解手段：请求级优先；控制面标注 best-effort；可选硬化——KCCM 记录该请求已注册的哈希集合，晚到命令触发"追补注销"（跳过共享块）。
 
 ### 11.2 Agent 与推理接口的交互通道
 
-1. **请求内通道（首选，原子）**：HTTP `extra_body` → API server 解析 → `Request` 对象字段 → EngineCore → scheduler `on_request_scheduled` 读取。适用于随请求声明 pin/ttl/no-store。
+1. **请求内通道（首选，原子）**：HTTP 顶层字段 `kv_transfer_params` → API server 解析 → `Request` 对象字段 → EngineCore → scheduler `on_request_scheduled` 读取。适用于随请求声明 pin/ttl/no-store。
 2. **会话外通道（控制面）**：HTTP 路由 → `AsyncLLM` → EngineCore RPC（沿用 `reset_prefix_cache` 等引擎级控制操作的既有通道）→ KCCM；DP 场景扇出全 rank，幂等收敛。适用于对**已产生内容**的 pin/set_ttl/release。
 
 ### 11.3 "token 级 / 内容级"控制的设计方案
@@ -483,7 +483,7 @@ Claude Code 是"纯客户端断点放置 + 服务端 TTL 淘汰"模型，客户�
 ### 14.1 pin
 
 ```
-Agent 请求级: extra_body {"kv_cache_control": {"mode":"pin","cache_key":"kb:doc:1","priority":10,"ttl_s":86400,"tier":"hbm"|"external"}}
+Agent 请求级: kv_transfer_params {"kv_cache_control": {"mode":"pin","cache_key":"kb:doc:1","priority":10,"ttl_s":86400,"tier":"hbm"|"external"}}
 Agent 控制面: POST /kv_cache/pin  → API server → call_utility("kv_cache_pin", ...) → EngineCore 反射 → scheduler.kv_cache_pin → KCCM.pin
 生效链: on_request_scheduled 读声明 → on_request_finished 用 Request.block_hashes(request.py:175) 展开条目
         → A1 patch BlockPool.get_new_blocks: pop 受害者时跳过 protection_level>0 的块(重新入队尾=LRU刷新), O(跳过数/次)
@@ -539,7 +539,7 @@ UT 优先覆盖：A1 受害者选择矩阵（mock 上游 BlockPool，参照 `tes
 
 1. **复用上游 `delay_cache_blocks`**：`KVCacheManager.allocate_slots`（vllm `kv_cache_manager.py:238-246`）已有 `delay_cache_blocks: bool = False` 参数（P/D 异步加载语义，`:422` 处跳过 `coordinator.cache_blocks`）。no-store 直接复用该语义，不自建写拦截。
 2. **双 chokepoint 覆盖全部 scheduler**：写缓存入口有两条——`allocate_slots` 内部（`:434` 直接调 coordinator）与显式 `KVCacheManager.cache_blocks`（`:553`，recompute 等路径）。对这两处做 wrapper（`allocate_slots` 强制 `delay_cache_blocks=True`；`cache_blocks` no-op），**无需任何 scheduler 钩子**，自动覆盖 Recompute/ProfilingChunk/Balance/DynamicBatch/上游基类全部调度器。
-3. **声明载体**：`kv_transfer_params["kv_cache_control"]`（OpenAI 层 `extra_body` 透传，request.py:101-117 已有通道），API 层零改动。
+3. **声明载体**：`kv_transfer_params["kv_cache_control"]`（OpenAI 层请求体顶层字段 `kv_transfer_params`，SDK 场景可用 `extra_body` 等价透传；request.py:101-117 已有通道），API 层零改动。
 4. **惰性解析**：声明在 chokepoint 处按请求解析并 memoize 到 Request 的 duck attribute，热路径开销 = 1 次 dict 查找 + 1 次 getattr；no-store 无需跨请求状态，KVCM 无需清理逻辑。
 5. KVCM 实例挂到 `KVCacheManager`（组合），不做模块级全局（符合仓库规范）。
 
@@ -580,7 +580,7 @@ class KVCacheControlManager:
 | 4 | 注册 patch | `vllm_ascend/patch/platform/__init__.py` | 仿 `:52` 的 import 行 |
 | 5 | 外部存储联动 | `pool_scheduler.py`（KVPoolScheduler） | 组装 store 请求元数据时检查声明，no-store → 不 put |
 | 6 | 单元测试 | `tests/ut/core/test_kv_cache_control_manager.py`、`tests/ut/patch/test_kv_cache_control_no_store.py` | mock 上游依赖（参照 `_mock_deps.py` 模式） |
-| 7 | 文档 | 设计文档状态更新 + 使用示例 | extra_body 示例 |
+| 7 | 文档 | 设计文档状态更新 + 使用示例 | `kv_transfer_params` 示例 |
 
 ### 15.4 测试用例
 
@@ -644,7 +644,7 @@ class KVCacheControlManager:
 
 关键实现说明：
 
-1. 声明载体 `kv_transfer_params["kv_cache_control"]`（经 OpenAI `extra_body` → `sampling_params.extra_args` → `Request.kv_transfer_params` 既有通道，API 层零改动）。解析结果 memoize 到 Request 的 `_kv_cache_control_parsed` 属性，热路径开销为一次 dict 查找 + 一次 getattr。
+1. 声明载体 `kv_transfer_params["kv_cache_control"]`（经请求体顶层字段 `kv_transfer_params` → serving 层写入 `extra_args["kv_transfer_params"]` → `Request.kv_transfer_params`，API 层零改动）。解析结果 memoize 到 Request 的 `_kv_cache_control_parsed` 属性，热路径开销为一次 dict 查找 + 一次 getattr。
 2. 双 chokepoint 覆盖全部调度器（Recompute/ProfilingChunk/Balance/DynamicBatch/上游基类），无需任何 scheduler 钩子。
 3. no-store 请求仍正常获得前缀命中（共享块不受影响），仅跳过新满块注册——对标 Claude Code `skipCacheWrite` 语义。
 4. `pin`/`ttl` 已声明但未支持：解析时告警并忽略（前向兼容，`unsupported_requests` 计数）。
@@ -690,3 +690,277 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/
 1. `pin`/`set_ttl`/`release` 为接口存根，按 §14 分期实现（P1/P2）。
 2. P/D disaggregated 场景下 `delay_cache_blocks` 组合行为需专项验证一次。
 3. 上游 vLLM 版本升级时，wrapper 锚点（`allocate_slots`/`cache_blocks` 签名）需复核。
+
+### 16.5 容器端到端实测记录（2026-09-14）
+
+本节记录 P0 no-store 在真实 Ascend NPU + 容器 + vLLM 0.23.0 环境下的完整 E2E 验证，覆盖 §15.5 验收标准 A1（功能）/ A2（零回归）/ A5（稳定性）；A4（外部存储不写入）需启用 AscendStore 连接器，不在本轮纯 HBM 验证范围内。
+
+#### 16.5.1 环境说明
+
+| 项 | 值 |
+| --- | --- |
+| 硬件 | Ascend 910B4 ×1（`ASCEND_VISIBLE_DEVICES=0`） |
+| 容器运行时 | containerd + `nerdctl`（ascend OCI runtime） |
+| 镜像 | `quay.io/ascend/vllm-ascend:v0.23.0`（vLLM 0.23.0，vllm-ascend editable install 于 `/vllm-workspace/vllm-ascend`） |
+| 代码注入 | 将本分支 5 个改动文件 copy 覆盖进容器内 `/vllm-workspace/vllm-ascend`（editable install，纯 Python 无需重编译，避免整仓挂载遮蔽已编译 `.so`） |
+| 模型 | Qwen/Qwen2.5-0.5B（HF 缓存快照 `060db6499f32faf8b98477b0a26969ef7d8b9987`） |
+| 网络 | `--net host`（共享宿主网络，端口 8000） |
+
+启动容器（宿主 shell）：
+
+```bash
+nerdctl run -d --name vllm-nostore-e2e --net host \
+  --runtime /var/lib/npu-container-toolkit/runtime/ascend-docker-runtime \
+  -e ASCEND_VISIBLE_DEVICES=0 \
+  -e HF_HUB_OFFLINE=1 -e TRANSFORMERS_OFFLINE=1 \
+  -v /home/cxy/vllm-ascend:/src/vllm-ascend:ro \
+  -v /home/llm_cache/huggingface:/root/.cache/huggingface:ro \
+  quay.io/ascend/vllm-ascend:v0.23.0 sleep 300000
+```
+
+注入改动文件（5 个源码 + 3 个 UT）：
+
+```bash
+nerdctl exec vllm-nostore-e2e bash -lc '
+SRC=/src/vllm-ascend; DST=/vllm-workspace/vllm-ascend
+cp $SRC/vllm_ascend/core/kv_cache_control_manager.py              $DST/vllm_ascend/core/kv_cache_control_manager.py
+cp $SRC/vllm_ascend/patch/platform/patch_kv_cache_control.py      $DST/vllm_ascend/patch/platform/patch_kv_cache_control.py
+cp $SRC/vllm_ascend/patch/platform/__init__.py                    $DST/vllm_ascend/patch/platform/__init__.py
+cp $SRC/vllm_ascend/envs.py                                       $DST/vllm_ascend/envs.py
+cp $SRC/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py \
+   $DST/vllm_ascend/distributed/kv_transfer/kv_pool/ascend_store/pool_scheduler.py
+'
+```
+
+启动推理服务（必须开启 `--enable-prompt-tokens-details`，否则 `cached_tokens` 恒为 `null`）：
+
+```bash
+nerdctl exec vllm-nostore-e2e bash -lc '
+cd /workspace
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 VLLM_ASCEND_KV_CACHE_CONTROL=1
+MODEL=/root/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B/snapshots/060db6499f32faf8b98477b0a26969ef7d8b9987
+setsid nohup python3 -m vllm.entrypoints.openai.api_server \
+  --model $MODEL --served-model-name qwen2.5-0.5b \
+  --host 0.0.0.0 --port 8000 \
+  --enable-prefix-caching --enable-prompt-tokens-details \
+  --max-model-len 8192 --dtype bfloat16 \
+  > /tmp/vllm-serve.log 2>&1 &'
+```
+
+#### 16.5.2 测试脚本
+
+脚本仅依赖标准库，保存为 `nostore_e2e.py` 后运行：
+
+```python
+#!/usr/bin/env python3
+"""P0 no-store E2E 验收（A1 A/B 对照 + A2/A5 并发一致性 + metrics 交叉校验）。
+
+前置：服务已就绪（16.5.1），并开启 --enable-prefix-caching
+      --enable-prompt-tokens-details。仅依赖标准库。
+"""
+from __future__ import annotations
+
+import json
+import sys
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+
+BASE = "http://127.0.0.1:8000"
+MODEL = "qwen2.5-0.5b"
+
+
+def make_doc(seed: str, blocks: int = 120) -> str:
+    """生成一段唯一长文档（约 blocks*40 token，覆盖多个 KV block）。"""
+    return " ".join(
+        f"{seed} paragraph {i} the quick brown fox jumps over the lazy dog "
+        f"cataloging distant galaxies and cryptographic protocols segment {i}."
+        for i in range(blocks)
+    )
+
+
+def chat(doc: str, no_store: bool, max_tokens: int = 8) -> tuple[int, int]:
+    """发送一次 chat 请求，返回 (cached_tokens, prompt_tokens)。
+
+    no_store 时随请求声明 kv_transfer_params.kv_cache_control.mode=no_store。
+    """
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "user", "content": doc}],
+        "max_tokens": max_tokens,
+    }
+    if no_store:
+        body["kv_transfer_params"] = {"kv_cache_control": {"mode": "no_store"}}
+    req = urllib.request.Request(
+        f"{BASE}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=180) as r:
+        resp = json.loads(r.read())
+    usage = resp["usage"]
+    details = usage.get("prompt_tokens_details") or {}  # 无命中时为 null
+    return details.get("cached_tokens", 0), usage["prompt_tokens"]
+
+
+def check(cond: bool, msg: str) -> bool:
+    print(f"  [{'PASS' if cond else 'FAIL'}] {msg}")
+    return cond
+
+
+def main() -> int:
+    ok = True
+
+    print("== A1 no-store 功能（A/B 对照） ==")
+    doc_x = make_doc("CONTROL-DOC-X")
+    doc_y = make_doc("NOSTORE-DOC-Y")
+    c_a1, _ = chat(doc_x, no_store=False)   # 对照 A'：首请求，无声明
+    c_b1, _ = chat(doc_x, no_store=False)   # 对照 B'：同文档，无声明 → 应命中
+    c_a2, _ = chat(doc_y, no_store=True)    # no-store A：长文档，带声明
+    c_b2, _ = chat(doc_y, no_store=False)   # no-store B：同文档，无声明 → 应不命中
+    print(f"  对照 A' cached={c_a1}  B' cached={c_b1}")
+    print(f"  no-store A cached={c_a2}  B cached={c_b2}")
+    ok &= check(c_b1 > 100 and c_b1 > c_a1, f"对照 B' 显著命中（cached={c_b1}）")
+    ok &= check(c_b2 <= 1, f"no-store B 零命中（cached={c_b2}）")
+
+    print("== A2/A5 无声明零回归 + 并发稳定性 ==")
+    docs = [make_doc(f"BURST-{k}", blocks=40) for k in range(12)]
+    flags = [False] * 6 + [True] * 6
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        futs = [ex.submit(chat, docs[i], flags[i]) for i in range(12)]
+        for f in futs:
+            f.result()  # 任一失败即抛异常
+    print("  12 并发请求完成，无异常")
+    consistent = True
+    for i in range(12):
+        rc, _ = chat(docs[i], no_store=False)  # 复播：普通应命中、no-store 不应
+        consistent &= rc > 100 if i < 6 else rc == 0
+    ok &= check(consistent, "普通请求重复命中 / no-store 请求重复不命中")
+
+    print("== metrics 交叉校验（vllm:prefix_cache_*） ==")
+    with urllib.request.urlopen(f"{BASE}/metrics", timeout=30) as r:
+        metrics = r.read().decode()
+
+    def metric(name: str) -> float:
+        for line in metrics.splitlines():
+            if line.startswith(name):
+                return float(line.rsplit(" ", 1)[1])
+        return 0.0
+
+    hits = metric("vllm:prefix_cache_hits_total")
+    queries = metric("vllm:prefix_cache_queries_total")
+    print(f"  prefix_cache_hits_total={hits}  queries_total={queries}")
+    ok &= check(hits > 0 and queries > 0, "prefix cache 指标正常输出")
+
+    print(f"\nRESULT: {'PASS' if ok else 'FAIL'}")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+```
+
+#### 16.5.3 脚本使用说明
+
+1. 按 16.5.1 启动容器、注入代码、拉起服务，确认 `curl http://127.0.0.1:8000/v1/models` 返回 200。
+2. 保存 16.5.2 脚本为 `nostore_e2e.py`，用宿主 `python3` 运行（服务经 `--net host` 共享端口 8000）：
+   ```bash
+   python3 nostore_e2e.py
+   ```
+3. 通过标准：脚本逐项打印 `[PASS]`，末尾 `RESULT: PASS`，退出码 0。
+4. UT 回归（真实 vllm 环境，容器内直接跑）：
+   ```bash
+   nerdctl exec vllm-nostore-e2e bash -lc 'cd /vllm-workspace/vllm-ascend && python3 -m pytest -q \
+     tests/ut/core/test_kv_cache_control_manager.py \
+     tests/ut/patch/platform/test_kv_cache_control_no_store.py \
+     tests/ut/distributed/ascend_store/test_kvcc_no_store.py'
+   ```
+
+#### 16.5.4 测试用例与结果
+
+| # | 验收项 | 用例 | 通过标准 | 实测结果 |
+| --- | --- | --- | --- | --- |
+| UT | 单元测试（真实 vllm 环境） | UT-1/2/3 共 31 例 | 全绿 | 31 passed |
+| A1 | no-store 功能 | 对照 A'→B'（doc X，无声明）；no-store A→B（doc Y） | B' cached 显著 >0；B cached ≈0 | B'=4608，B=0 ✅ |
+| A2 | 无声明零回归 | 6 普通请求复播 | 重复请求正常命中 | 复播 cached=640 ✅ |
+| A5 | 块回收/并发稳定 | 12 并发（6 普通 + 6 no-store）复播 | 无异常、语义一致 | 12/12 无异常；no-store 复播 cached=0 ✅ |
+| — | metrics 交叉校验 | 读 `/metrics` | `prefix_cache_hits`/`queries` 正常 | hits=4608，queries=19356 ✅ |
+
+补充说明：
+
+1. A1 对照组证实前缀缓存本身工作正常（B' 命中 4608 token），no-store 组证实声明后该文档**零注册**（B 命中 0 token）；二者区分度 100%，与 `vllm:prefix_cache_hits_total` 计数一致。
+2. `"Got kv_transfer_params, but no KVConnector found. Disabling KVTransfer for this request."` 为预期 warning（未配置连接器），只影响外部 KV 池路径，不影响 HBM 前缀缓存的 no-store 语义（见 §16.3 说明）。
+3. 未验证 A3（热路径开销 <1%）与 A4（外部存储不写入，需 AscendStore）——A3 需基准对比、A4 需连接器，均为后续工作。
+
+## 17. P1/P2 实现与验收（pin / set_ttl / release / 控制面）
+
+### 17.1 本轮决策
+
+| 事项 | 决定 |
+| --- | --- |
+| 超额行为 | 控制面与请求级统一：降级为普通缓存 + warning + `quota_degraded` 计数，无 409 |
+| 外部删除 | memcache 走 `batch_remove_lease` 真删；mooncake/yuanrong 无按 key 删除 API，打日志降级（要点标记） |
+| HTTP 路由 | 本轮实现：wrap `api_server.build_app` 挂 `/kv_cache/*`，生产鉴权依赖部署网关（与 /reset_prefix_cache 同信任级） |
+| 控制面 pin vs 请求级 pin | 请求级随请求原子声明（作用于本请求产出内容）；控制面作用于已有内容（依赖该 key 曾被请求级声明登记）；共享注册表，pin_count 叠加 |
+
+### 17.2 实现清单
+
+| 文件 | 内容 |
+| --- | --- |
+| `core/kv_cache_control_manager.py` | LifecycleEntry 注册表（(namespace, cache_key) 双索引：entries + hash→entries）、`pin`/`set_ttl`/`release`/`release_key`/`flush`/`protection_level`/`has_protection`/`maybe_sweep`/`on_request_finished`/`take_release_plan`、配额（`VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO`，默认 0.25，按 `len(hash_index)/num_gpu_blocks` 计）、惰性 sweep（挂 allocate_slots，next_expiry O(1) 快路径） |
+| `patch/platform/patch_kv_cache_control.py` | 新增 free wrapper（finish 时捕获 `Request.block_hashes` 激活/替换条目，prefix_tokens 按 block_size floor）、allocate_slots 挂 sweep、init 绑定 block_pool 与 block_size |
+| `patch/platform/patch_kv_cache_eviction.py`（新） | A1 驱逐过滤：`BlockPool.get_new_blocks` 逐块 pop，保护块（`protection_level>0`）暂存并 re-append 队尾（LRU 刷新）；**软 pin 兜底**：队列耗尽仍未收满则按队列顺序（最冷优先）牺牲保护块，永不阻塞分配，`pin_evictions` 计数；无保护 fast path |
+| `patch/platform/patch_kv_cache_control_engine.py`（新） | EngineCore setattr 四方法（kv_cache_pin/set_ttl/release/flush，走 `call_utility` 反射通道）；AsyncLLM.`kv_cache_control_async`；wrap `build_app` 挂路由 |
+| `entrypoints/kv_cache_router.py`（新） | `POST /kv_cache/{pin,ttl,release,flush}`，pydantic 请求体，async/sync client 兼容 |
+| `ascend_store` 四文件 | `AscendConnectorMetadata.delete_keys` 字段；KVPoolScheduler.`queue_external_delete` + build_connector_meta 组装 `model@hash_hex` 键；AscendStoreConnector 代理；pool_worker.`get_finished` 消费 → `m_store.batch_remove_lease`（hasattr 探测 + 异常降级） |
+
+release 语义：pin_count-1（handle）或清零（key）；归零注销并产出释放计划 = 条目哈希 − 仍被其他活跃条目保护的哈希（排除自身）；`_evict_hashes` 遍历 group 构造 `BlockHashWithGroupId` → `get_one_block` → `evict_blocks`（复用上游，自动发 `BlockRemoved` 事件）；块仅注销+提升驱逐优先级，不物理回收（§12.5）。TTL 到期 = 降级 NORMAL（`ttl_expired` 计数），非硬删。
+
+### 17.3 测试与本地验证结果
+
+| 文件 | 用例 |
+| --- | --- |
+| test_kv_cache_control_manager.py（14） | 解析矩阵 + pin 三态/TTL 过期/同 key 替换延长/pin_count 释放/释放计划排除他人保护/配额降级/prefix floor/sweep/flush |
+| test_kv_cache_control_no_store.py（11） | 双 wrapper + free 钩子（捕获激活条目）+ 幂等 + env 开关 |
+| test_kv_cache_eviction_filter.py（6） | fast path/保护跳过与 requeue/匿名块/全保护兜底/队列顺序/不足抛错 |
+| test_kv_cache_control_engine.py（10） | EngineCore 转发/释放驱逐与外部删除队列/flush 两路/AsyncLLM 入口/build_app 挂载/路由端点 |
+| test_kvcc_no_store.py（13） | no-store 跳过 + 外部删除组装/代理/worker 消费/不支持后端跳过 |
+
+本地（无 torch/vllm）全部通过；ascend_store 全套 187 passed；ruff check/format 通过。
+
+### 17.4 容器验收标准
+
+| # | 场景 | 步骤 | 通过标准 |
+| --- | --- | --- | --- |
+| P1-1 | pin 抗驱逐 | 请求带 `{"mode":"pin","cache_key":"X"}` 产生长文档 → 灌多个大文档挤占 → 重复请求 X | X 的 cached_tokens 保持高位；未 pin 旧内容命中≈0 |
+| P1-2 | TTL 过期 | `{"mode":"ttl","cache_key":"S","ttl_s":60}` | 30s 后请求命中>0；>60s+压力后命中≈0 |
+| P1-3 | 同 key 延长 | 第二轮同 cache_key 声明 | 条目替换延长，metrics 单调 |
+| P2-1 | release 隔离 | 会话 A release（共享提示词他方 pin） | A 私有前缀 miss；共享提示仍命中 |
+| P2-2 | flush | `POST /kv_cache/flush {"keep_protected": true}` | 受保护保留，其余 miss |
+| P2-3 | 超配额降级 | 调小 VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO 后 pin 大内容 | 行为等同普通请求，日志 warning，quota_degraded 递增 |
+| P2-4 | 外部删除 | memcache 后端 release | `exists(keys)==0`；mooncake 后端日志降级 |
+| 性能 | 驱逐过滤开销 | 高压+pin 场景 TPS/TTFT | 回归 <2%；无保护 fast path <1% |
+
+curl 示例：
+
+```bash
+# pin（会话后对已有内容）
+curl -s -X POST http://127.0.0.1:8000/kv_cache/pin -H "Content-Type: application/json" \
+  -d '{"cache_key": "session-abc", "priority": 5, "ttl_s": 86400}'
+# release（agent 会话结束钩子）
+curl -s -X POST http://127.0.0.1:8000/kv_cache/release -H "Content-Type: application/json" \
+  -d '{"cache_key": "session-abc"}'
+# flush
+curl -s -X POST http://127.0.0.1:8000/kv_cache/flush -H "Content-Type: application/json" -d '{"keep_protected": true}'
+```
+
+请求级声明（与 no-store 同通道）：`"kv_transfer_params": {"kv_cache_control": {"mode": "pin", "cache_key": "X", "priority": 5}}` 或 `{"mode": "ttl", "cache_key": "S", "ttl_s": 600}`。
+
+### 17.5 已知限制与后续
+
+1. namespace 级配额未实现（仅全局比例），多租户隔离依赖部署侧。
+2. `tier="external"` 仅登记不降级（demote 复用 offload 体系，后续接入）。
+3. 兜底牺牲保护块按队列顺序（LRU），未按 priority 细排；`pin_evictions` 指标可观测。
+4. DP 场景控制面扇出与 `reset_prefix_cache` 同链路，多 DP 行为需容器专项确认。
+5. 上游锚点：`BlockPool.get_new_blocks`/`evict_blocks`/`KVCacheManager.free`/`EngineCore` 反射，升级需复核。

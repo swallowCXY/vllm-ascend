@@ -156,6 +156,11 @@ class AscendStoreConnector(KVConnectorBase_V1, SupportsHMA):
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished(request, block_ids)
 
+    def queue_external_delete(self, block_hashes) -> None:
+        """Queue external KV pool keys for deletion (KV cache release flow)."""
+        assert self.connector_scheduler is not None
+        self.connector_scheduler.queue_external_delete(block_hashes)
+
     def request_finished_all_groups(
         self,
         request: "Request",

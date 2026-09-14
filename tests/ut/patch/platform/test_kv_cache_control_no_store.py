@@ -44,7 +44,7 @@ _FAKE_MODULES = (
     "vllm_ascend.patch.platform",
 )
 
-_calls = {"allocate": [], "cache_blocks": []}
+_calls = {"allocate": [], "cache_blocks": [], "free": []}
 
 
 class _FakeKVCacheManager:
@@ -58,11 +58,22 @@ class _FakeKVCacheManager:
     def cache_blocks(self, request, num_computed_tokens):
         _calls["cache_blocks"].append(num_computed_tokens)
 
+    def free(self, request):
+        _calls["free"].append(request.request_id)
+
 
 def _no_store_request():
     return SimpleNamespace(
         kv_transfer_params={"kv_cache_control": {"mode": "no_store"}},
         request_id="r1",
+    )
+
+
+def _pin_request():
+    return SimpleNamespace(
+        kv_transfer_params={"kv_cache_control": {"mode": "pin", "cache_key": "k"}},
+        request_id="r3",
+        block_hashes=[b"h0", b"h1"],
     )
 
 
@@ -80,6 +91,7 @@ def patched_module(monkeypatch):
     """
     _calls["allocate"].clear()
     _calls["cache_blocks"].clear()
+    _calls["free"].clear()
 
     saved = {name: sys.modules.get(name) for name in _FAKE_MODULES}
 
@@ -177,6 +189,19 @@ class TestNoStorePatch:
         manager = _make_manager()
         manager.cache_blocks(_normal_request(), 128)
         assert _calls["cache_blocks"] == [128]
+
+    def test_free_invokes_lifecycle_hook(self, patched_module):
+        manager = _make_manager()
+        manager.free(_pin_request())
+        assert _calls["free"] == ["r3"]
+        assert len(manager.kv_cache_control_manager._entries) == 1
+        assert manager.kv_cache_control_manager.protection_level(b"h0") == 1
+
+    def test_free_without_declaration_noop(self, patched_module):
+        manager = _make_manager()
+        manager.free(_normal_request())
+        assert _calls["free"] == ["r2"]
+        assert manager.kv_cache_control_manager._entries == {}
 
     def test_patch_is_idempotent(self, patched_module):
         first = _FakeKVCacheManager.allocate_slots
