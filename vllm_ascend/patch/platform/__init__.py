@@ -45,6 +45,8 @@ import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_coordinator  # noqa
 import vllm_ascend.patch.platform.patch_swa_inflight_free  # noqa
 import vllm_ascend.patch.platform.patch_kv_cache_control  # noqa
+import vllm_ascend.patch.platform.patch_kv_cache_eviction  # noqa
+import vllm_ascend.patch.platform.patch_kv_cache_control_engine  # noqa
 import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 
 import vllm_ascend.patch.platform.patch_fused_moe  # noqa

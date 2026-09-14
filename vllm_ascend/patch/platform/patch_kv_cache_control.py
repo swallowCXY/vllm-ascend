@@ -63,15 +63,29 @@ def _apply_patch() -> None:
     @wraps(_original_init)
     def _patched_init(self: KVCacheManager, *args: Any, **kwargs: Any) -> None:
         _original_init(self, *args, **kwargs)
-        self.kv_cache_control_manager = KVCacheControlManager()
+        kvcm = KVCacheControlManager()
+        self.kv_cache_control_manager = kvcm
+        block_pool = getattr(self, "block_pool", None)
+        if block_pool is not None:
+            block_pool.kv_cache_control_manager = kvcm
+        block_size = None
+        try:
+            kv_cache_config = getattr(self, "kv_cache_config", None)
+            if kv_cache_config is not None and kv_cache_config.kv_cache_groups:
+                block_size = kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+        except AttributeError:
+            block_size = None
+        kvcm.bind_kv_cache_manager(self, block_size)
 
     _original_allocate_slots = KVCacheManager.allocate_slots
 
     @wraps(_original_allocate_slots)
     def _patched_allocate_slots(self: KVCacheManager, request: Any, *args: Any, **kwargs: Any) -> Any:
         kvcm = getattr(self, "kv_cache_control_manager", None)
-        if kvcm is not None and kvcm.is_no_store(request):
-            args, kwargs = _force_delay_cache_blocks(args, kwargs)
+        if kvcm is not None:
+            kvcm.maybe_sweep()
+            if kvcm.is_no_store(request):
+                args, kwargs = _force_delay_cache_blocks(args, kwargs)
         return _original_allocate_slots(self, request, *args, **kwargs)
 
     _original_cache_blocks = KVCacheManager.cache_blocks
@@ -83,14 +97,25 @@ def _apply_patch() -> None:
             return
         return _original_cache_blocks(self, request, num_computed_tokens)
 
+    _original_free = KVCacheManager.free
+
+    @wraps(_original_free)
+    def _patched_free(self: KVCacheManager, request: Any) -> None:
+        kvcm = getattr(self, "kv_cache_control_manager", None)
+        if kvcm is not None:
+            kvcm.on_request_finished(request)
+        return _original_free(self, request)
+
     _patched_init.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]
     _patched_allocate_slots.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]
     _patched_cache_blocks.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]
+    _patched_free.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]
 
     KVCacheManager.__init__ = _patched_init
     KVCacheManager.allocate_slots = _patched_allocate_slots
     KVCacheManager.cache_blocks = _patched_cache_blocks
-    logger.info("KV cache control enabled: request-level no-store support applied")
+    KVCacheManager.free = _patched_free
+    logger.info("KV cache control enabled: no-store / pin / ttl support applied")
 
 
 _apply_patch()
