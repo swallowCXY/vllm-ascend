@@ -1,6 +1,6 @@
 # KV Cache 生命周期控制 — 验收规格书
 
-> 版本：v2.1（分支 `feat/kv-cache-control-v0.25.1rc1`，基线 vllm-ascend **v0.25.1rc1** / vLLM 0.25.1）
+> 版本：v2.2（分支 `feat/kv-cache-control-v0.25.1rc1`，基线 vllm-ascend **v0.25.1rc1** / vLLM 0.25.1）
 > 用途：与需求方确认功能范围、调用方式、验收标准与功能边界。
 > 配套设计文档：`KV_Cache_Control_Manager.md`（§18 为本轮需求收敛后的最终实现记录）。
 > 注：v0.23.0 基线的实测记录（设计文档 §16.5）为历史存档；本分支锚点已针对 vLLM 0.25.1 重新验证。
@@ -11,8 +11,8 @@
 | --- | --- | --- |
 | pin：前缀硬保护 + 必有 TTL（默认 1 小时） | message 内 | 已实现，待容器验收 |
 | no-store：整个请求内容不写缓存 | message 内 | 已实现，P0 已实测通过 |
-| release：整个请求缓存释放（会话收尾） | message 内 / HTTP | 已实现，待容器验收 |
-| HTTP 控制面 | — | 仅保留 `POST /kv_cache/release`；pin/TTL/flush 不允许会话后操作 |
+| release：整个请求缓存释放（会话收尾，纯声明式） | message 内 | 已实现，待容器验收 |
+| HTTP 控制面 | — | **已移除**（release 仅声明式，无会话后追溯释放） |
 
 ## 2. 语义基线（验收前必读）
 
@@ -63,16 +63,11 @@ requests.post(f"{BASE}/v1/chat/completions", json={
 })
 ```
 
-### 3.2 HTTP 控制面（仅 release）
+### 3.2 控制面
 
-```
-POST /kv_cache/release
-{"request_id": "chatcmpl-..."}          → {"released": true|false}
-```
+无 HTTP 控制面（v2.2 移除）：release 仅支持 message 级声明，随请求原子生效，不做会话后追溯释放。漏声明的请求无法事后按内容释放（全局手段仅剩 `reset_prefix_cache`）。
 
-- 按已完成请求的 `request_id` 注销其全部缓存注册
-- 依赖引擎内的请求记录表（容量 `VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE`=4096，FIFO 淘汰；超出容量的旧请求返回 `released=false`）
-- 未配置 KVConnector 时引擎对 `kv_transfer_params` 打印 warning，属预期
+未配置 KVConnector 时引擎对 `kv_transfer_params` 打印 warning，属预期。
 
 ### 3.3 配置项
 
@@ -81,7 +76,6 @@ POST /kv_cache/release
 | `VLLM_ASCEND_KV_CACHE_CONTROL` | `1` | 总开关；`0` 时所有声明被忽略，行为与基线一致 |
 | `VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO` | `0.25` | pin 保护块数占总 GPU KV 块上限比例；超限新 pin 不激活 + 日志 |
 | `VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S` | `3600` | pin 默认 TTL |
-| `VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE` | `4096` | HTTP release 可追溯的已完成请求数 |
 
 ### 3.4 观测通道
 
@@ -121,9 +115,8 @@ POST /kv_cache/release
 | ID | 用例 | 步骤 | 通过标准 |
 | --- | --- | --- | --- |
 | AC-REL-01 | 请求级释放 | sub agent 收尾请求带 `{"mode":"release"}` → 完成后重放同前缀 | cached_tokens ≤ 1（确定性） |
-| AC-REL-02 | HTTP 释放 | 请求完成后 `POST /kv_cache/release {"request_id"}` → 重放 | miss；响应 `released=true` |
-| AC-REL-03 | 幂等/未登记 | 重复 release / 未知 request_id | `released=false`，无异常 |
-| AC-REL-04 | 全删语义确认 | release 的请求命中过共享前缀 S（S 未被 pin）→ 释放后重放 | S 也 miss（全删语义，需求方需认可） |
+| AC-REL-02 | 全删语义确认 | release 的请求命中过共享前缀 S（S 未被 pin）→ 释放后重放 | S 也 miss（全删语义，需求方需认可） |
+| AC-REL-03 | 与 pin 互斥 | release 请求中任一 message 带 pin | release 不生效（前缀按 pin 保护），响应提示 `conflict_modes` |
 
 ### 4.4 互斥（AC-CONF）
 
@@ -145,18 +138,18 @@ POST /kv_cache/release
 ## 5. 功能边界（明确不保证的行为）
 
 1. **pin 硬保护 ≠ 无限保护**：受 TTL 约束（默认 1h）；自请求完成起生效；极端压力下系统可能对非 pin 流量产生抢占（pin 池最大占配额比例）。
-2. **release 全删**：不做"仅删本请求新增"的区分——共享且未 pin 的前缀会被连带注销（AC-REL-04）。被覆盖的他人 pin 条目残留但失去保护对象；同内容被重新计算注册后，原 TTL 内会再次受保护。
-3. **非物理回收/无即时清零**：仅注销命中注册；需要"数据立即不可恢复"合规语义需另行立项。
-4. **块粒度与边界最佳努力**：尾部不完整块不保护；模板非前缀单调时声明不生效并提示。
-5. **互斥即全不生效**：混合 mode 的整条声明丢弃（含合法部分），以响应提示告知。
-6. **配额超限无同步提示**：配额判定在请求完成时（引擎侧），仅日志 + 计数；响应中的 status 只反映 serving 层可判定的冲突类拒绝。
-7. **流式响应无 status 字段**：仅日志（非流式有 JSON 字段）。
-8. **控制面仅 release**：pin/TTL/flush 不可会话后操作；release 按 request_id 受记录表容量限制；无内置鉴权（依赖部署网关）。
+2. **release 全删**：不做"仅删本请求新增"的区分——共享且未 pin 的前缀会被连带注销（AC-REL-02）。被覆盖的他人 pin 条目残留但失去保护对象；同内容被重新计算注册后，原 TTL 内会再次受保护。
+3. **release 纯声明式**：必须在收尾请求上声明；漏声明后无事后按内容释放手段（等 LRU/重启，或全局 `reset_prefix_cache`）。
+4. **非物理回收/无即时清零**：仅注销命中注册；需要"数据立即不可恢复"合规语义需另行立项。
+5. **块粒度与边界最佳努力**：尾部不完整块不保护；模板非前缀单调时声明不生效并提示。
+6. **互斥即全不生效**：混合 mode 的整条声明丢弃（含合法部分），以响应提示告知。
+7. **配额超限无同步提示**：配额判定在请求完成时（引擎侧），仅日志 + 计数；响应中的 status 只反映 serving 层可判定的冲突类拒绝。
+8. **流式响应无 status 字段**：仅日志（非流式有 JSON 字段）。
 9. **无 external store 集成**：tier/外部删除已移除。
 10. **无 Prometheus 导出**：生命周期计数未接入 /metrics。
-11. **易失性**：注册表/记录表为进程内存态，重启失效。
+11. **易失性**：注册表为进程内存态，重启失效。
 12. **模型范围**：标准 prefix caching 模型（FullAttention 族）；hybrid/SWA 未验证。
-13. **上游锚点**：依赖 vLLM 0.23.0（`delay_cache_blocks`/`evict_blocks`/utility 反射/serving 结构），升级需回归。
+13. **上游锚点**：依赖 vLLM 0.25.1（`delay_cache_blocks`/`evict_blocks`/serving 结构），升级需回归。
 
 ## 6. 验收结果记录
 

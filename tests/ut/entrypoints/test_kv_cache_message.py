@@ -15,7 +15,14 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import asyncio
+import importlib.util
+import sys
+import types
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.entrypoints import kv_cache_message as kcm
@@ -206,3 +213,139 @@ class TestResponseStatus:
             __slots__ = ()
 
         kcm.attach_status_to_response(request, _Frozen())
+
+
+class TestChatServingPatch:
+    """Wrappers installed by ``patch_kv_cache_control._patch_chat_serving``."""
+
+    @pytest.fixture()
+    def patched_serving(self):
+        """Fake the chat-serving module and (re)load the control patch module.
+
+        Restores ``sys.modules`` afterwards so other test files are unaffected.
+        """
+        fake_names = (
+            "vllm",
+            "vllm.v1",
+            "vllm.v1.core",
+            "vllm.v1.core.kv_cache_manager",
+            "vllm.v1.core.kv_cache_utils",
+            "vllm_ascend.patch",
+            "vllm_ascend.patch.platform",
+        )
+        saved = {name: sys.modules.get(name) for name in fake_names}
+        vllm_mod = types.ModuleType("vllm")
+        v1_mod = types.ModuleType("vllm.v1")
+        core_mod = types.ModuleType("vllm.v1.core")
+
+        class _FakeKVCacheManager:
+            def allocate_slots(self, *args, **kwargs):
+                return None
+
+            def cache_blocks(self, *args, **kwargs):
+                return None
+
+            def free(self, *args, **kwargs):
+                return None
+
+        mgr_mod = types.ModuleType("vllm.v1.core.kv_cache_manager")
+        mgr_mod.KVCacheManager = _FakeKVCacheManager
+        kv_cache_utils_mod = types.ModuleType("vllm.v1.core.kv_cache_utils")
+        kv_cache_utils_mod.get_block_hash = lambda block_hash: block_hash
+        kv_cache_utils_mod.make_block_hash_with_group_id = lambda block_hash, group_id: (block_hash, group_id)
+
+        class _FakeServingChat:
+            def __init__(self):
+                self.renderer = SimpleNamespace(tokenizer=_FakeTokenizer())
+                self.chat_template = None
+                self.default_chat_template_kwargs = {}
+
+            async def render_chat_request(self, request):
+                return "RENDERED"
+
+            async def create_chat_completion(self, request, raw_request=None):
+                return SimpleNamespace(mark="RESPONSE")
+
+        serving_mod = types.ModuleType("vllm.entrypoints.openai.chat_completion.serving")
+        serving_mod.OpenAIServingChat = _FakeServingChat
+        openai_mod = types.ModuleType("vllm.entrypoints.openai")
+        openai_mod.chat_completion = types.ModuleType("vllm.entrypoints.openai.chat_completion")
+        openai_mod.chat_completion.serving = serving_mod
+        vllm_mod.v1 = v1_mod
+        v1_mod.core = core_mod
+        openai_pkg = types.ModuleType("vllm.entrypoints.openai")
+        openai_pkg.chat_completion = openai_mod.chat_completion
+        entrypoints_mod = types.ModuleType("vllm.entrypoints")
+        entrypoints_mod.openai = openai_pkg
+        patch_pkg = types.ModuleType("vllm_ascend.patch")
+        patch_pkg.__path__ = []
+        platform_pkg = types.ModuleType("vllm_ascend.patch.platform")
+        patch_file = Path(__file__).resolve().parents[3] / "vllm_ascend/patch/platform/patch_kv_cache_control.py"
+        platform_pkg.__path__ = [str(patch_file.parent)]
+        for name, mod in (
+            ("vllm", vllm_mod),
+            ("vllm.v1", v1_mod),
+            ("vllm.v1.core", core_mod),
+            ("vllm.v1.core.kv_cache_manager", mgr_mod),
+            ("vllm.v1.core.kv_cache_utils", kv_cache_utils_mod),
+            ("vllm.entrypoints", entrypoints_mod),
+            ("vllm.entrypoints.openai", openai_pkg),
+            ("vllm.entrypoints.openai.chat_completion", openai_mod.chat_completion),
+            ("vllm.entrypoints.openai.chat_completion.serving", serving_mod),
+            ("vllm_ascend.patch", patch_pkg),
+            ("vllm_ascend.patch.platform", platform_pkg),
+        ):
+            sys.modules[name] = mod
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "vllm_ascend.patch.platform.patch_kv_cache_control", patch_file
+            )
+            mod = importlib.util.module_from_spec(spec)
+            sys.modules[spec.name] = mod
+            spec.loader.exec_module(mod)
+            yield mod, _FakeServingChat
+        finally:
+            for name, original in saved.items():
+                if original is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = original
+            sys.modules.pop("vllm_ascend.patch.platform.patch_kv_cache_control", None)
+
+    def test_wrappers_installed(self, patched_serving):
+        mod, serving_cls = patched_serving
+        assert getattr(serving_cls.render_chat_request, "__vcc_no_store_patched__", False)
+        assert getattr(serving_cls.create_chat_completion, "__vcc_no_store_patched__", False)
+
+    def test_render_wrapper_injects(self, patched_serving):
+        _, serving_cls = patched_serving
+        serving = serving_cls()
+        request = _request([_msg("user", "a"), _msg("user", "b" * 40, {"mode": "pin"})])
+        result = asyncio.run(serving.render_chat_request(request))
+        assert result == "RENDERED"
+        injected = request.kv_transfer_params["kv_cache_control"]
+        assert injected["mode"] == "pin"
+        assert injected["pin_boundary_tokens"] == int(41 * 0.25)
+
+    def test_create_wrapper_attaches_status(self, patched_serving):
+        _, serving_cls = patched_serving
+        serving = serving_cls()
+        request = _request([_msg("user", "a", {"mode": "pin"})])
+        asyncio.run(serving.render_chat_request(request))
+        raw = object()
+        result = asyncio.run(serving.create_chat_completion(request, raw))
+        assert result.mark == "RESPONSE"
+        assert result.kv_cache_control_status == {"status": "accepted", "reason": "pin"}
+
+    def test_create_wrapper_no_status_for_undeclared(self, patched_serving):
+        _, serving_cls = patched_serving
+        serving = serving_cls()
+        request = _request([_msg("user", "a")])
+        result = asyncio.run(serving.create_chat_completion(request, None))
+        assert not hasattr(result, "kv_cache_control_status")
+
+    def test_patch_is_idempotent(self, patched_serving):
+        mod, serving_cls = patched_serving
+        first = serving_cls.render_chat_request
+        mod._apply_patch()
+        assert serving_cls.render_chat_request is first

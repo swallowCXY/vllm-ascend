@@ -1,7 +1,7 @@
 # KVCacheControlManager 设计（KV cache 生命周期控制）
 
 > 分支基线：`feat/kv-cache-control-v0.25.1rc1`（vllm-ascend v0.25.1rc1 / vLLM 0.25.1）
-> 本文描述**当前实现**的最终设计。历史演进（0.23.0 基线上的 P0/P1/P2 与需求收敛过程）见 git 提交记录与本文件旧版本；验收用例与边界细则见配套《验收规格书》（`KV_Cache_Control_Acceptance_Spec.md` v2.1）。
+> 本文描述**当前实现**的最终设计。历史演进（0.23.0 基线上的 P0/P1/P2 与需求收敛过程）见 git 提交记录与本文件旧版本；验收用例与边界细则见配套《验收规格书》（`KV_Cache_Control_Acceptance_Spec.md` v2.2）。
 
 ## 1. 背景与动机
 
@@ -72,14 +72,9 @@ POST /v1/chat/completions
 | `mode` | 必填 | `pin` / `no_store` / `release` |
 | `ttl_s` | pin 可选 | 保护时长秒数，缺省 3600 |
 
-### 3.2 HTTP 控制面（仅 release）
+### 3.2 控制面
 
-```
-POST /kv_cache/release
-{"request_id": "chatcmpl-..."}          → {"released": true|false}
-```
-
-按已完成请求的 `request_id` 注销其全部缓存注册。依赖引擎内请求历史表（容量 `VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE`=4096，FIFO 淘汰；超出容量的旧请求返回 `released=false`）。无内置鉴权，生产由部署网关负责（与 `/reset_prefix_cache` 同信任级）。
+无 HTTP 控制面（已移除）：release 仅支持 message 级声明（`mode: "release"`），声明随请求原子生效，不做会话后追溯释放。
 
 ### 3.3 配置项
 
@@ -88,7 +83,6 @@ POST /kv_cache/release
 | `VLLM_ASCEND_KV_CACHE_CONTROL` | `1` | 总开关；`0` 时所有声明被忽略，行为与基线一致 |
 | `VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO` | `0.25` | pin 保护块数占总 GPU KV 块数上限比例；超限新 pin 不激活 + 日志提示 |
 | `VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S` | `3600` | pin 默认 TTL |
-| `VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE` | `4096` | HTTP release 可追溯的已完成请求数 |
 
 ### 3.4 观测通道
 
@@ -143,11 +137,10 @@ class PinEntry:
 class KVCacheControlManager:
     _pin_entries: dict[request_id, PinEntry]       # 注册表
     _hash_index: dict[hash, set[request_id]]       # 反查索引，protection_level O(1)
-    _request_history: dict[request_id, hashes]     # 已完成请求表（FIFO 上限），支撑 HTTP release
     _release_plan: list[hashes]                    # 待执行注销计划（由 free wrapper 消费）
 ```
 
-API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_store`/`is_release`、`on_request_finished`、`release_request`、`take_release_plan`、`protection_level`（0/1）、`has_protection`（快路径）、`maybe_sweep`（惰性 TTL 过期，挂 `allocate_slots` wrapper，`next_expiry` O(1) 快路径）、`bind_kv_cache_manager`（绑定配额分母与 block_size）。
+API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_store`/`is_release`、`on_request_finished`、`take_release_plan`、`protection_level`（0/1）、`has_protection`（快路径）、`maybe_sweep`（惰性 TTL 过期，挂 `allocate_slots` wrapper，`next_expiry` O(1) 快路径）、`bind_kv_cache_manager`（绑定配额分母与 block_size）。
 
 声明解析：serving 层聚合后引擎只见单 mode + 可选 `pin_boundary_tokens`/`ttl_s`；pin 的 TTL 缺省取 `VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S`。
 
@@ -157,7 +150,7 @@ API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_st
 
 **A2 no-store 双 chokepoint**（`patch_kv_cache_control.py`）：`allocate_slots` 对 no-store 请求强制 `delay_cache_blocks=True`（复用上游 P/D 异步加载语义），`cache_blocks` 直接 no-op。位置参数守卫处理 `delay_cache_blocks` 的第 6 位传参。共享前缀已注册的哈希不受影响（对标 Claude Code `skipCacheWrite`：只读不写）。
 
-**生命周期钩子**（`KVCacheManager.free` wrapper）：请求完成时依次执行 KCCM `on_request_finished`（pin 激活含配额硬判定 / release 出队注销计划 / 历史记录）→ `take_release_plan` → `evict_hashes`（跨 group 哈希→块解析，复用上游 `BlockPool.evict_blocks`，自动发 `BlockRemoved` KV 事件）。`allocate_slots` wrapper 捕获 `PinProtectedExhaustedError` 并返回 `None` → 走上游正常 preemption 路径。
+**生命周期钩子**（`KVCacheManager.free` wrapper）：请求完成时执行 KCCM `on_request_finished`（pin 激活含配额硬判定 / release 出队注销计划）→ `take_release_plan` → `evict_hashes`（跨 group 哈希→块解析，复用上游 `BlockPool.evict_blocks`，自动发 `BlockRemoved` KV 事件）。`allocate_slots` wrapper 捕获 `PinProtectedExhaustedError` 并返回 `None` → 走上游正常 preemption 路径。
 
 ### 5.3 serving 层（`entrypoints/kv_cache_message.py`）
 
@@ -167,9 +160,9 @@ API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_st
 - **注入**：写入 `request.kv_transfer_params["kv_cache_control"]`（挂点为 `OpenAIServingChat.render_chat_request` wrapper，早于 `to_sampling_params` 构建，API 层零改动）。
 - **提示**：status 暂存于 request，`create_chat_completion` wrapper 附加到非流式响应 `kv_cache_control_status` 字段（流式仅日志）。
 
-### 5.4 控制面（仅 release）
+### 5.4 控制面
 
-`EngineCore.kv_cache_release(request_id)` 经既有 `call_utility` 反射通道（`EngineCoreRequestType.UTILITY` → `getattr(self, method_name)`）到达；`AsyncLLM.kv_cache_control_async` 为通用入口；`build_app` wrapper 挂载 `/kv_cache/release` 路由。不含任何会话后修改 pin/TTL 的能力（需求决策）。
+无独立控制面：release 为声明式（随请求原子生效），不做会话后追溯释放。serving 层 patch（`_patch_chat_serving`）亦由本模块安装：`render_chat_request` 注入 + 非流式响应附加 `kv_cache_control_status`。
 
 ### 5.5 块状态机与 release 语义
 
@@ -203,7 +196,7 @@ API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_st
 4. 块粒度 + 边界最佳努力（模板非前缀单调 → 声明不生效并提示）。
 5. 互斥即全不生效；配额超限仅日志提示（无同步响应提示）。
 6. 流式响应无 status 字段（仅日志）。
-7. 控制面仅 release；记录表容量限制；无内置鉴权。
+7. **无 HTTP 控制面**：release 仅声明式，漏声明的请求无事后释放手段（等 LRU/重启，或全量 `reset_prefix_cache`）。
 8. 无 external store 集成；无 Prometheus 导出；重启易失。
 9. 模型范围：标准 prefix caching 模型（FullAttention 族）；hybrid/SWA 未验证。
 10. 上游锚点依赖 vLLM 0.25.1（见 §11.3），升级需回归。
@@ -215,21 +208,21 @@ API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_st
 | # | 风险 | 应对 |
 | --- | --- | --- |
 | 1 | `get_new_blocks`/`allocate_slots` patch 与上游漂移 | patch 面最小化 + marker 幂等 + feature flag；升级时锚点复核（§11.3 清单） |
-| 2 | release 全删误伤共享内容 | 已确认为需求语义；被覆盖的他人 pin 条目在原 TTL 内对重算内容继续生效；文档与验收用例（AC-REL-04）显式标注 |
+| 2 | release 全删误伤共享内容 | 已确认为需求语义；被覆盖的他人 pin 条目在原 TTL 内对重算内容继续生效；文档与验收用例（AC-REL-02）显式标注 |
 | 3 | 硬保护引发非 pin 流量抢占 | 已确认接受；`quota_degraded`/日志可观测；配额比例可调 |
 | 4 | 消息边界计算依赖模板单调性 | 渲染串前缀校验，不满足即拒绝并提示；不影响请求本身 |
 | 5 | TTL 精度 | monotonic 时钟 + 惰性清扫，秒级误差（一个调度步内） |
-| 6 | 元数据/历史表内存膨胀 | pin 池受配额约束；历史表 FIFO 上限（4096） |
-| 7 | DP/多副本 | release 控制命令与 `reset_prefix_cache` 同链路扇出，多 DP 行为待容器专项确认 |
-| 8 | 权限与滥用 | `/kv_cache/release` 无内置鉴权，依赖部署网关；无 namespace 配额（后续项） |
+| 6 | 元数据内存膨胀 | pin 池受配额约束；声明解析 memoize |
+| 7 | DP/多副本 | KCCM 每 rank 一份，声明随请求到达各自生效；跨 rank 一致性由请求路由保证 |
+| 8 | 漏声明无法事后释放 | release 为纯声明式；遗漏时只能等 LRU/重启或全量 `reset_prefix_cache`（已知代价） |
 | 9 | hybrid/SWA/压缩模型 | 未验证；`protection_level` 对未覆盖场景保守返回（无保护） |
-| 10 | 重启丢失 | 注册表/历史表内存态；重启后需重新声明 |
+| 10 | 重启丢失 | 注册表内存态；重启后需重新声明 |
 | 11 | 热路径性能 | 钩子 O(1)；sweep 摊还；UT 与容器回归覆盖（AC-PERF-01/02） |
 | 12 | P/D disaggregated 场景 | `delay_cache_blocks` 原有语义与 no-store 组合需容器专项验证一次 |
 
 ## 9. 测试与验收
 
-- **UT（83 个，本地全绿）**：核心 20（解析矩阵/pin 生命周期/release/history 表/sweep）、wrapper 12（no-store 双 chokepoint/free 钩子/幂等/env 开关）、驱逐过滤 6（保护跳过/耗尽抛错/队列恢复）、控制面 8（release 反射/路由/服务 patch）、消息级 18（提取/裁决/边界/单调校验/注入/提示）、ascend_store 9（no-store 跳过点）。
+- **UT（76 个，本地全绿）**：核心 17（解析矩阵/pin 生命周期/release 计划/sweep）、wrapper 12（no-store 双 chokepoint/free 钩子/幂等/env 开关）、驱逐过滤 6（保护跳过/耗尽抛错/队列恢复）、消息级 23（提取/裁决/边界/单调校验/注入/提示/chat serving wrapper）、ascend_store 9（no-store 跳过点）。
 - **回归**：ascend_store 全套 186 passed（v0.25.1rc1 基线）。
 - **容器验收**：按《验收规格书》§4 执行（v0.23.0 基线的 no-store E2E 实测记录已存档于本文件 git 历史）；待办：vLLM 0.25.1 镜像下三链路专项回归。
 
@@ -241,6 +234,7 @@ API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_st
 | P1/P2 | 软 pin + 引用计数 + 控制面 + 外部存储集成 | 被 v2 需求收敛**取代** |
 | v2 | message 级三 mode（pin 硬保护+TTL 合一 / release 全删 / 互斥裁决） | 当前实现 |
 | 迁移 | 0.23.0 → 0.25.1rc1（cherry-pick + 锚点预验证） | 当前分支 |
+| v2.2 | 移除 HTTP release 路由与请求历史表（release 纯声明式） | 当前实现 |
 
 ## 11. 附录
 
@@ -248,7 +242,7 @@ API：`parse_request_control`（解析+memoize 到 Request 属性）、`is_no_st
 
 **Claude Code（客户端侧）**：断点式 `cache_control`（message/content block 上）与消息级声明形态同源；`skipCacheWrite`（断点移到倒数第二条消息 = 只写共享前缀）与 no-store 语义等价；`tengu_cache_eviction_hint`（conversation_clear/session_end/subagent_end）只能提示、由服务端执行——本设计的 release 即其服务端执行者；TTL 由服务商标管理，本设计引擎自主。会话稳定锁存（TTL 资格/tool schema/beta header 会话级锁定）是贯穿性纪律：**会话中途不翻转缓存键**。
 
-**上游 vLLM**：驱逐纯 LRU、无优先级/保护位/TTL 概念（`BlockPool`），唯一保护是 `ref_cnt>0`；`skip_reading_prefix_cache` 只跳读、无跳写——no-store 补的是上游空白。`evict_blocks` + `BlockRemoved` 事件、`call_utility` 反射通道、`cache_salt` 第 0 块隔离机制均为本设计直接复用的既有设施。Claude Code 的 cached microcompact（`cache_edits` 中段删除）在 vLLM 内容寻址模型下无对应机制，以 release+重新预热近似。
+**上游 vLLM**：驱逐纯 LRU、无优先级/保护位/TTL 概念（`BlockPool`），唯一保护是 `ref_cnt>0`；`skip_reading_prefix_cache` 只跳读、无跳写——no-store 补的是上游空白。`evict_blocks` + `BlockRemoved` 事件、`cache_salt` 第 0 块隔离机制均为本设计直接复用的既有设施。Claude Code 的 cached microcompact（`cache_edits` 中段删除）在 vLLM 内容寻址模型下无对应机制，以 release+重新预热近似。
 
 ### 11.2 token 级与块对齐约束
 
@@ -269,8 +263,5 @@ KV 因果性（token i 的 KV 依赖全部前序 token）决定了只有**前缀
 | `BlockPool.get_new_blocks` / `evict_blocks` / `get_num_free_blocks` / `free_block_queue` / `cached_block_hash_to_block.get_one_block` | block_pool.py:542/637/692 |
 | `make_block_hash_with_group_id` / `get_block_hash` | kv_cache_utils.py:57/69 |
 | `Request.block_hashes` / `kv_transfer_params` | request.py:179/115 |
-| UTILITY 反射 `getattr(self, method_name)` / `call_utility_async` | core.py:1393 / core_client.py:1101 |
-| `AsyncLLM.engine_core` | async_llm.py |
-| `api_server.build_app` | api_server.py:157 |
 | `OpenAIServingChat.render_chat_request` → `to_sampling_params` 时序（render 后、采样构建前） | serving.py:206→318 |
 | `ChatCompletionRequest.kv_transfer_params` 顶层字段 / `OpenAIBaseModel` extra="allow" | protocol.py |

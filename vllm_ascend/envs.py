@@ -115,10 +115,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Default TTL (seconds) for message-level pin declarations that do not
     # carry an explicit ttl_s. Default 3600 (1 hour).
     "VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S": lambda: float(os.getenv("VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S", "3600")),
-    # Capacity of the finished-request hash table used by the out-of-band
-    # /kv_cache/release route. Oldest entries are dropped beyond the cap.
-    # Default 4096.
-    "VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE": lambda: int(os.getenv("VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE", "4096")),
 }
 
 # end-env-vars-definition

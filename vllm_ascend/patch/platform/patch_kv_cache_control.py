@@ -14,21 +14,34 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""Request-level KV cache ``no_store`` support.
+"""KV cache lifecycle control patches (no-store / pin / release).
 
-Requests declaring ``kv_transfer_params={"kv_cache_control": {"mode":
-"no_store"}}`` never register their blocks into the prefix cache:
+Engine side:
 
-- ``allocate_slots`` is forced into the upstream ``delay_cache_blocks`` path
-  (the same mechanism used by P/D async load), and
-- explicit ``KVCacheManager.cache_blocks`` calls become no-ops.
+- Requests declaring ``mode: no_store`` never register their blocks into the
+  prefix cache: ``allocate_slots`` is forced into the upstream
+  ``delay_cache_blocks`` path (the same mechanism used by P/D async load) and
+  explicit ``KVCacheManager.cache_blocks`` calls become no-ops.
+- Requests declaring ``mode: pin`` get their prefix hard-protected at finish
+  (see ``patch_kv_cache_eviction``); ``mode: release`` unregisters all of the
+  request's prefix-cache registrations via ``evict_hashes``.
+- ``allocate_slots`` converts ``PinProtectedExhaustedError`` into an
+  allocation failure (``None``) so the scheduler preempts normally instead of
+  evicting pinned content.
 
-Requests without the declaration (the vast majority) follow the original code
-path with one dict lookup of overhead. Shared prefix blocks registered by
-other requests are never touched, matching Claude Code's ``skipCacheWrite``
-semantics: read cache hits still apply, only new writes are skipped.
+Serving side:
+
+- ``OpenAIServingChat.render_chat_request`` extracts message-level
+  ``kv_cache_control`` declarations, adjudicates conflicts and computes pin
+  boundaries (see ``entrypoints/kv_cache_message``) before the engine inputs
+  are built; ``create_chat_completion`` attaches the adjudication outcome to
+  non-streaming responses as ``kv_cache_control_status``.
+
+Requests without declarations follow the original code path with one dict
+lookup of overhead.
 """
 
+from collections.abc import AsyncGenerator
 from functools import wraps
 from typing import Any
 
@@ -133,7 +146,47 @@ def _apply_patch() -> None:
     KVCacheManager.allocate_slots = _patched_allocate_slots
     KVCacheManager.cache_blocks = _patched_cache_blocks
     KVCacheManager.free = _patched_free
-    logger.info("KV cache control enabled: no-store / pin / ttl support applied")
+    _patch_chat_serving()
+    logger.info("KV cache control enabled: no-store / pin / release support applied")
+
+
+def _patch_chat_serving() -> None:
+    """Message-level declaration extraction + response status attachment."""
+    try:
+        from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+    except ImportError:
+        logger.warning("OpenAI chat serving not importable; message-level declarations inactive")
+        return
+    from vllm_ascend.entrypoints.kv_cache_message import (
+        attach_status_to_response,
+        inject_request_control,
+    )
+
+    if getattr(OpenAIServingChat.render_chat_request, _PATCH_MARKER, False):
+        return
+
+    _original_render = OpenAIServingChat.render_chat_request
+
+    @wraps(_original_render)
+    async def _patched_render_chat_request(self: Any, request: Any) -> Any:
+        inject_request_control(self, request)
+        return await _original_render(self, request)
+
+    _patched_render_chat_request.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]
+    OpenAIServingChat.render_chat_request = _patched_render_chat_request
+
+    _original_create = OpenAIServingChat.create_chat_completion
+
+    @wraps(_original_create)
+    async def _patched_create_chat_completion(self: Any, request: Any, raw_request: Any = None) -> Any:
+        result = await _original_create(self, request, raw_request)
+        if raw_request is not None and not isinstance(result, AsyncGenerator):
+            attach_status_to_response(request, result)
+        return result
+
+    _patched_create_chat_completion.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]
+    OpenAIServingChat.create_chat_completion = _patched_create_chat_completion
+    logger.info("KV cache control enabled: message-level declaration handling applied")
 
 
 _apply_patch()

@@ -166,38 +166,6 @@ class TestRelease:
         assert plan == _hashes(3)
         assert kvcm.take_release_plan() == []
 
-    def test_release_request_via_http(self):
-        kvcm = KVCacheControlManager()
-        req = _request("no_store")
-        req.block_hashes = _hashes(2)
-        req.request_id = "r1"
-        kvcm.on_request_finished(req)
-        assert kvcm.release_request("r1") is True
-        assert sorted(kvcm.take_release_plan()) == sorted(_hashes(2))
-        assert kvcm.release_request("r1") is False
-        assert kvcm.release_request("unknown") is False
-
-    def test_http_release_removes_pin_entry(self):
-        kvcm = KVCacheControlManager()
-        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
-        req = _request("pin")
-        req.block_hashes = _hashes(2)
-        kvcm.on_request_finished(req)
-        assert kvcm.release_request("r1") is True
-        assert kvcm.protection_level(b"h0") == 0
-
-    def test_history_cap_evicts_oldest(self, monkeypatch):
-        monkeypatch.setenv("VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE", "2")
-        kvcm = KVCacheControlManager()
-        for i in range(3):
-            req = _request("no_store")
-            req.request_id = f"r{i}"
-            req.block_hashes = [f"h{i}".encode()]
-            kvcm.on_request_finished(req)
-        assert "r0" not in kvcm._request_history
-        assert kvcm.release_request("r0") is False
-        assert kvcm.release_request("r2") is True
-
 
 class TestNoStorePath:
     def test_no_store_finish_is_noop_for_registry(self):
@@ -207,12 +175,12 @@ class TestNoStorePath:
         kvcm.on_request_finished(req)
         assert kvcm._pin_entries == {}
         assert kvcm.take_release_plan() == []
-        assert len(kvcm._request_history) == 1
 
-    def test_request_without_declaration_recorded(self):
+    def test_request_without_declaration_noop(self):
         kvcm = KVCacheControlManager()
         req = _request()
         req.request_id = "r9"
         req.block_hashes = _hashes(2)
         kvcm.on_request_finished(req)
-        assert kvcm.release_request("r9") is True
+        assert kvcm._pin_entries == {}
+        assert kvcm.take_release_plan() == []

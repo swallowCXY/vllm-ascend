@@ -93,7 +93,6 @@ class KVCacheControlManager:
         self._release_plan: list[Any] = []
         self._kv_cache_manager: Any = None
         self._block_size: int | None = None
-        self._request_history: dict[str, list[Any]] = {}
 
     def bind_kv_cache_manager(self, kv_cache_manager: Any, block_size: int | None = None) -> None:
         """Bind the owning KVCacheManager for quota accounting."""
@@ -166,15 +165,12 @@ class KVCacheControlManager:
         """
         control = self.parse_request_control(request)
         if control is None:
-            self._record_history(request)
             return
         hashes = list(getattr(request, "block_hashes", None) or [])
         if control["mode"] == _MODE_PIN:
             self._activate_pin(request, hashes, control)
-        elif control["mode"] == _MODE_RELEASE:
-            if hashes:
-                self._release_plan.extend(hashes)
-        self._record_history(request, hashes)
+        elif control["mode"] == _MODE_RELEASE and hashes:
+            self._release_plan.extend(hashes)
 
     def _activate_pin(self, request: Request, hashes: list[Any], control: dict[str, Any]) -> None:
         request_id = request.request_id
@@ -203,33 +199,9 @@ class KVCacheControlManager:
             self._hash_index.setdefault(block_hash, set()).add(request_id)
         self._recompute_next_expiry()
 
-    def _record_history(self, request: Request, hashes: list[Any] | None = None) -> None:
-        """Record finished request hashes for out-of-band HTTP release."""
-        if hashes is None:
-            hashes = list(getattr(request, "block_hashes", None) or [])
-        if not hashes:
-            return
-        request_id = getattr(request, "request_id", None)
-        if not request_id:
-            return
-        self._request_history[request_id] = hashes
-        cap = envs.VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE
-        while len(self._request_history) > cap:
-            oldest = next(iter(self._request_history))
-            del self._request_history[oldest]
-
     # ------------------------------------------------------------------
-    # HTTP release (out-of-band, by request_id)
+    # Release plan (consumed by the KVCacheManager.free wrapper)
     # ------------------------------------------------------------------
-
-    def release_request(self, request_id: str) -> bool:
-        """Unregister all prefix-cache registrations of a finished request."""
-        hashes = self._request_history.pop(request_id, None)
-        if hashes is None:
-            return False
-        self._unregister(request_id)
-        self._release_plan.extend(hashes)
-        return True
 
     def take_release_plan(self) -> list[Any]:
         """Pop the pending block-level release plan (raw block hashes)."""
