@@ -103,7 +103,6 @@ class KVPoolScheduler:
         self.kv_cache_control = (
             KVCacheControlManager() if ascend_envs.VLLM_ASCEND_KV_CACHE_CONTROL else None
         )
-        self._pending_delete_keys: list[str] = []
         self.pcp_size = getattr(vllm_config.parallel_config, "prefill_context_parallel_size", 1)
         self.dcp_size = getattr(vllm_config.parallel_config, "decode_context_parallel_size", 1)
 
@@ -188,17 +187,6 @@ class KVPoolScheduler:
         self.keys_per_block_hash = keys_per_block_hash
 
         self.client: LookupKeyClient | None = None
-
-    def queue_external_delete(self, block_hashes) -> None:
-        """Queue external KV pool keys for deletion (release flow)."""
-        self._pending_delete_keys.extend(block_hash.hex() for block_hash in block_hashes)
-
-    def _pop_delete_keys(self) -> list[str] | None:
-        if not self._pending_delete_keys:
-            return None
-        keys = [f"{self.model_name}@{key}" for key in self._pending_delete_keys]
-        self._pending_delete_keys.clear()
-        return keys
 
     def _is_no_store_request(self, request: "Request") -> bool:
         return self.kv_cache_control is not None and self.kv_cache_control.is_no_store(request)
@@ -958,7 +946,6 @@ class KVPoolScheduler:
             scheduler_output.preempted_req_ids,
             self._loading_req_ids.copy(),
             self._delayed_free_req_ids.copy(),
-            delete_keys=self._pop_delete_keys(),
         )
 
         for request in scheduler_output.scheduled_new_reqs:

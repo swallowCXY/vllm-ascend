@@ -38,6 +38,7 @@ _FAKE_MODULES = (
     "vllm",
     "vllm.v1",
     "vllm.v1.core",
+    "vllm.v1.core.kv_cache_manager",
     "vllm.v1.core.kv_cache_utils",
     "vllm.v1.engine",
     "vllm.v1.engine.core",
@@ -46,6 +47,8 @@ _FAKE_MODULES = (
     "vllm.entrypoints",
     "vllm.entrypoints.openai",
     "vllm.entrypoints.openai.api_server",
+    "vllm.entrypoints.openai.chat_completion",
+    "vllm.entrypoints.openai.chat_completion.serving",
     "vllm_ascend.patch",
     "vllm_ascend.patch.platform",
     "fastapi",
@@ -59,6 +62,14 @@ class _FakeEngineCore:
 
 class _FakeAsyncLLM:
     pass
+
+
+class _FakeServingChat:
+    async def render_chat_request(self, request):
+        return "RENDERED"
+
+    async def create_chat_completion(self, request, raw_request=None):
+        return SimpleNamespace(mark="RESPONSE")
 
 
 def _fake_fastapi():
@@ -92,6 +103,19 @@ def _build_fakes():
     vllm_mod = types.ModuleType("vllm")
     v1_mod = types.ModuleType("vllm.v1")
     core_mod = types.ModuleType("vllm.v1.core")
+
+    class _FakeKVCacheManagerForImport:
+        def allocate_slots(self, *args, **kwargs):
+            return None
+
+        def cache_blocks(self, *args, **kwargs):
+            return None
+
+        def free(self, *args, **kwargs):
+            return None
+
+    mgr_mod = types.ModuleType("vllm.v1.core.kv_cache_manager")
+    mgr_mod.KVCacheManager = _FakeKVCacheManagerForImport
     kv_cache_utils_mod = types.ModuleType("vllm.v1.core.kv_cache_utils")
     kv_cache_utils_mod.get_block_hash = lambda block_hash: (
         block_hash[0] if isinstance(block_hash, tuple) else block_hash
@@ -108,6 +132,9 @@ def _build_fakes():
     openai_mod = types.ModuleType("vllm.entrypoints.openai")
     api_server_mod = types.ModuleType("vllm.entrypoints.openai.api_server")
     api_server_mod.build_app = lambda *args, **kwargs: args[0] if args else kwargs.get("app")
+    chat_pkg = types.ModuleType("vllm.entrypoints.openai.chat_completion")
+    serving_mod = types.ModuleType("vllm.entrypoints.openai.chat_completion.serving")
+    serving_mod.OpenAIServingChat = _FakeServingChat
     patch_pkg = types.ModuleType("vllm_ascend.patch")
     patch_pkg.__path__ = []
     platform_pkg = types.ModuleType("vllm_ascend.patch.platform")
@@ -120,6 +147,7 @@ def _build_fakes():
                 vllm_mod,
                 v1_mod,
                 core_mod,
+                mgr_mod,
                 kv_cache_utils_mod,
                 engine_mod,
                 core_cls_mod,
@@ -128,6 +156,8 @@ def _build_fakes():
                 entrypoints_mod,
                 openai_mod,
                 api_server_mod,
+                chat_pkg,
+                serving_mod,
                 patch_pkg,
                 platform_pkg,
                 fastapi_mod,
@@ -144,19 +174,17 @@ def _build_fakes():
 def engine_env():
     saved = {name: sys.modules.get(name) for name in _FAKE_MODULES}
     api_server_mod = _build_fakes()
-    loaded = {}
     try:
         spec = spec_from_file_location(_PATCH_MODULE, _PATCH_FILE)
         mod = importlib.util.module_from_spec(spec)
         sys.modules[_PATCH_MODULE] = mod
         spec.loader.exec_module(mod)
-        loaded["patch"] = mod
+        loaded = {"patch": mod, "api_server_mod": api_server_mod}
         router_spec = spec_from_file_location(_ROUTER_MODULE, _ROUTER_FILE)
         router_mod = importlib.util.module_from_spec(router_spec)
         sys.modules[_ROUTER_MODULE] = router_mod
         router_spec.loader.exec_module(router_mod)
         loaded["router"] = router_mod
-        loaded["api_server_mod"] = api_server_mod
         yield loaded
     finally:
         for name, original in saved.items():
@@ -168,32 +196,27 @@ def engine_env():
         sys.modules.pop(_ROUTER_MODULE, None)
 
 
-def _kvcm_with_entry(key="k", num=2):
+def _kvcm_with_history(request_id="r1", num=2):
     kvcm = KVCacheControlManager()
     req = SimpleNamespace(
-        kv_transfer_params={"kv_cache_control": {"mode": "pin", "cache_key": key}},
-        request_id=f"req-{key}",
+        kv_transfer_params=None,
+        request_id=request_id,
         block_hashes=[f"h{i}".encode() for i in range(num)],
     )
     kvcm.on_request_finished(req)
     return kvcm
 
 
-def _fake_block_pool():
+def _fake_engine(kvcm):
+    evicted = []
     cached = {
         (b"h0", 0): SimpleNamespace(block_id=10),
         (b"h0", 1): SimpleNamespace(block_id=11),
-        (b"h2", 0): SimpleNamespace(block_id=12),
     }
-    evicted = []
 
     class _Map:
         def get_one_block(self, key):
             return cached.get(key)
-
-        @property
-        def _cache(self):
-            return cached
 
     class _Pool:
         num_gpu_blocks = 1000
@@ -203,58 +226,34 @@ def _fake_block_pool():
         def evict_blocks(block_ids):
             evicted.append(set(block_ids))
 
-    return _Pool(), cached, evicted
-
-
-def _fake_engine(kvcm):
-    block_pool, cached, evicted = _fake_block_pool()
     manager = SimpleNamespace(
-        block_pool=block_pool,
+        block_pool=_Pool(),
         kv_cache_config=SimpleNamespace(kv_cache_groups=[object(), object()]),
-        reset_prefix_cache=lambda: True,
+        kv_cache_control_manager=kvcm,
     )
-    manager.kv_cache_control_manager = kvcm
     kvcm.bind_kv_cache_manager(manager)
-    connector = SimpleNamespace(queue_external_delete=MagicMock())
-    engine = SimpleNamespace(
-        scheduler=SimpleNamespace(kv_cache_manager=manager, connector=connector),
-    )
+    engine = SimpleNamespace(scheduler=SimpleNamespace(kv_cache_manager=manager))
     return engine, evicted
 
 
-class TestEngineControlPlane:
-    def test_engine_core_methods_attached(self, engine_env):
-        for name in ("kv_cache_pin", "kv_cache_set_ttl", "kv_cache_release", "kv_cache_flush"):
-            assert hasattr(_FakeEngineCore, name)
+class TestEngineReleaseControlPlane:
+    def test_release_method_attached(self, engine_env):
+        assert hasattr(_FakeEngineCore, "kv_cache_release")
+        assert not hasattr(_FakeEngineCore, "kv_cache_pin")
+        assert not hasattr(_FakeEngineCore, "kv_cache_flush")
 
-    def test_pin_forwards_to_manager(self, engine_env):
-        kvcm = KVCacheControlManager()
-        engine, _ = _fake_engine(kvcm)
-        handle = _FakeEngineCore.kv_cache_pin(engine, "default", "k2", 3, 60.0, "hbm")
-        assert isinstance(handle, str)
-        assert kvcm.metrics["pin_requests"] == 1
-
-    def test_release_evicts_and_queues_external_delete(self, engine_env):
-        kvcm = _kvcm_with_entry("k")
+    def test_release_by_request_id(self, engine_env):
+        kvcm = _kvcm_with_history("r1")
         engine, evicted = _fake_engine(kvcm)
-        released = _FakeEngineCore.kv_cache_release(engine, "default", "k")
+        released = _FakeEngineCore.kv_cache_release(engine, "r1")
         assert released is True
         assert evicted == [{10, 11}]
-        kvcm_conn = engine.scheduler.connector.queue_external_delete
-        kvcm_conn.assert_called_once()
-        assert set(kvcm_conn.call_args[0][0]) == {b"h0", b"h1"}
+        assert kvcm.take_release_plan() == []
 
-    def test_flush_keep_protected(self, engine_env):
-        kvcm = _kvcm_with_entry("k")
-        engine, evicted = _fake_engine(kvcm)
-        evicted_blocks = _FakeEngineCore.kv_cache_flush(engine, True)
-        assert evicted_blocks == 1
-        assert evicted == [{12}]
-
-    def test_flush_without_protection_resets(self, engine_env):
+    def test_release_unknown_request(self, engine_env):
         engine, evicted = _fake_engine(KVCacheControlManager())
-        assert _FakeEngineCore.kv_cache_flush(engine, True) == 3
-        assert _FakeEngineCore.kv_cache_flush(engine, False) == -1
+        assert _FakeEngineCore.kv_cache_release(engine, "ghost") is False
+        assert evicted == []
 
     def test_async_llm_entry_point(self, engine_env):
         calls = []
@@ -266,11 +265,9 @@ class TestEngineControlPlane:
 
         engine_llm = _FakeAsyncLLM()
         engine_llm.engine_core = _Client()
-        result = asyncio.run(
-            _FakeAsyncLLM.kv_cache_control_async(engine_llm, "kv_cache_pin", "ns", "k", 0, None, "hbm")
-        )
+        result = asyncio.run(_FakeAsyncLLM.kv_cache_control_async(engine_llm, "kv_cache_release", "r1"))
         assert result == "OK"
-        assert calls[0][0] == "kv_cache_pin"
+        assert calls == [("kv_cache_release", ("r1",))]
 
     def test_build_app_mounts_router(self, engine_env):
         api_server_mod = engine_env["api_server_mod"]
@@ -279,22 +276,14 @@ class TestEngineControlPlane:
         assert result is app
         app.include_router.assert_called_once()
 
+    def test_chat_serving_wrapped(self, engine_env):
+        assert getattr(_FakeServingChat.render_chat_request, "__vcc_router_attached__", False)
+        assert getattr(_FakeServingChat.create_chat_completion, "__vcc_router_attached__", False)
 
-class TestRouterEndpoints:
-    def test_pin_endpoint(self, engine_env):
-        kvcm = KVCacheControlManager()
-        engine, _ = _fake_engine(kvcm)
-        client = SimpleNamespace(
-            call_utility=MagicMock(return_value="HANDLE"),
-        )
-        raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(engine_client=client)))
-        req = engine_env["router"].PinRequest(cache_key="k", priority=2)
-        resp = asyncio.run(engine_env["router"].pin(req, raw))
-        assert resp == {"handle": "HANDLE"}
-        client.call_utility.assert_called_once_with("kv_cache_pin", "default", "k", 2, None, "hbm")
 
+class TestRouterReleaseOnly:
     def test_release_endpoint(self, engine_env):
-        kvcm = _kvcm_with_entry("k")
+        kvcm = _kvcm_with_history("r1")
         engine, _ = _fake_engine(kvcm)
         calls = []
 
@@ -304,17 +293,11 @@ class TestRouterEndpoints:
                 return _FakeEngineCore.kv_cache_release(engine, *args)
 
         raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(engine_client=_Client())))
-        req = engine_env["router"].KeyRequest(cache_key="k")
+        req = engine_env["router"].ReleaseRequest(request_id="r1")
         resp = asyncio.run(engine_env["router"].release(req, raw))
         assert resp == {"released": True}
         assert calls == ["kv_cache_release"]
 
-    def test_flush_endpoint(self, engine_env):
-        client = SimpleNamespace(
-            call_utility=MagicMock(return_value=5),
-        )
-        raw = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(engine_client=client)))
-        req = engine_env["router"].FlushRequest(keep_protected=False)
-        resp = asyncio.run(engine_env["router"].flush(req, raw))
-        assert resp == {"evicted_blocks": 5}
-        client.call_utility.assert_called_once_with("kv_cache_flush", False)
+    def test_router_has_only_release(self, engine_env):
+        paths = [path for path, _ in engine_env["router"].router.routes]
+        assert paths == ["/release"]

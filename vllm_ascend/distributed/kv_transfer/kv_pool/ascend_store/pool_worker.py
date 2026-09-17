@@ -1587,19 +1587,7 @@ class KVPoolWorker:
             for layer_id in range(self.num_layers):
                 yield
 
-    def _remove_external_keys(self, keys: list[str]) -> None:
-        remove = getattr(self.m_store, "batch_remove_lease", None)
-        if remove is None:
-            logger.debug("Backend does not support batch_remove_lease; skip deleting %d keys", len(keys))
-            return
-        try:
-            remove(keys)
-        except Exception:
-            logger.exception("batch_remove_lease failed for %d keys", len(keys))
-
     def get_finished(self, finished_req_ids: set[str], meta: AscendConnectorMetadata) -> tuple[set[str], set[str]]:
-        if meta.delete_keys:
-            self._remove_external_keys(meta.delete_keys)
         if self.kv_send_thread is not None:
             send_thread = self.kv_send_thread
             for req_id in meta.preempted_req_ids:

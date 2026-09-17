@@ -36,7 +36,11 @@ from vllm.logger import logger
 from vllm.v1.core.kv_cache_manager import KVCacheManager
 
 from vllm_ascend import envs
-from vllm_ascend.core.kv_cache_control_manager import KVCacheControlManager
+from vllm_ascend.core.kv_cache_control_manager import (
+    KVCacheControlManager,
+    PinProtectedExhaustedError,
+)
+from vllm_ascend.core.kv_cache_evict_utils import evict_hashes
 
 # Positional index of ``delay_cache_blocks`` in ``allocate_slots`` after
 # ``self`` and ``request`` (see vllm/v1/core/kv_cache_manager.py).
@@ -86,7 +90,13 @@ def _apply_patch() -> None:
             kvcm.maybe_sweep()
             if kvcm.is_no_store(request):
                 args, kwargs = _force_delay_cache_blocks(args, kwargs)
-        return _original_allocate_slots(self, request, *args, **kwargs)
+        try:
+            return _original_allocate_slots(self, request, *args, **kwargs)
+        except PinProtectedExhaustedError:
+            # All free blocks are hard-protected; fail this allocation so the
+            # scheduler takes its normal preemption path instead of evicting
+            # pinned content.
+            return None
 
     _original_cache_blocks = KVCacheManager.cache_blocks
 
@@ -104,6 +114,14 @@ def _apply_patch() -> None:
         kvcm = getattr(self, "kv_cache_control_manager", None)
         if kvcm is not None:
             kvcm.on_request_finished(request)
+            plan = kvcm.take_release_plan()
+            if plan:
+                evicted = evict_hashes(self, plan)
+                logger.info(
+                    "KV cache release for request %s unregistered %d blocks",
+                    getattr(request, "request_id", "?"),
+                    evicted,
+                )
         return _original_free(self, request)
 
     _patched_init.__vcc_no_store_patched__ = True  # type: ignore[attr-defined]

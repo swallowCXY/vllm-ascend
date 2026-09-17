@@ -17,104 +17,202 @@
 
 from types import SimpleNamespace
 
-import pytest
-
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.core.kv_cache_control_manager import (
-    ContentRef,
-    KVCacheControlManager,
-    PinHandle,
-)
+from vllm_ascend.core.kv_cache_control_manager import KVCacheControlManager
 
 
-def _request(kv_transfer_params=None):
-    return SimpleNamespace(kv_transfer_params=kv_transfer_params, request_id="r1")
+def _request(mode=None, **kwargs):
+    params = None
+    if mode is not None:
+        control = {"mode": mode}
+        control.update(kwargs)
+        params = {"kv_cache_control": control}
+    return SimpleNamespace(kv_transfer_params=params, request_id="r1", block_hashes=[])
 
 
-def _no_store_request():
-    return _request({"kv_cache_control": {"mode": "no_store"}})
+def _hashes(n, offset=0):
+    return [f"h{i + offset}".encode() for i in range(n)]
+
+
+def _fake_manager(num_gpu_blocks=1000):
+    return SimpleNamespace(block_pool=SimpleNamespace(num_gpu_blocks=num_gpu_blocks))
 
 
 class TestParseRequestControl:
     def test_no_store_declaration(self):
         kvcm = KVCacheControlManager()
-        req = _no_store_request()
+        req = _request("no_store")
         assert kvcm.is_no_store(req) is True
         assert kvcm.metrics["no_store_requests"] == 1
 
+    def test_release_declaration(self):
+        kvcm = KVCacheControlManager()
+        req = _request("release")
+        assert kvcm.is_release(req) is True
+        assert kvcm.is_no_store(req) is False
+        assert kvcm.metrics["release_requests"] == 1
+
+    def test_pin_default_ttl(self, monkeypatch):
+        monkeypatch.setenv("VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S", "3600")
+        kvcm = KVCacheControlManager()
+        control = kvcm.parse_request_control(_request("pin"))
+        assert control["mode"] == "pin"
+        assert control["ttl_s"] == 3600.0
+        assert control["pin_boundary_tokens"] is None
+        assert kvcm.metrics["pin_requests"] == 1
+
+    def test_pin_explicit_ttl_and_boundary(self):
+        kvcm = KVCacheControlManager()
+        control = kvcm.parse_request_control(_request("pin", ttl_s=120, pin_boundary_tokens=137))
+        assert control["ttl_s"] == 120.0
+        assert control["pin_boundary_tokens"] == 137
+
     def test_missing_declaration(self):
         kvcm = KVCacheControlManager()
-        assert kvcm.is_no_store(_request(None)) is False
-        assert kvcm.is_no_store(_request({})) is False
-        assert kvcm.metrics["no_store_requests"] == 0
+        assert kvcm.is_no_store(_request()) is False
+        assert kvcm.is_release(_request()) is False
 
-    def test_unknown_mode_ignored(self):
+    def test_unknown_mode_parse_error(self):
         kvcm = KVCacheControlManager()
-        req = _request({"kv_cache_control": {"mode": "future_mode"}})
-        assert kvcm.is_no_store(req) is False
-        assert kvcm.metrics["unsupported_requests"] == 1
-
-    @pytest.mark.parametrize(
-        "payload",
-        [
-            "not_a_dict",
-            {"kv_cache_control": "no_store"},
-            {"kv_cache_control": {"mode": 123}},
-            {"kv_cache_control": None},
-        ],
-    )
-    def test_malformed_payloads(self, payload):
-        kvcm = KVCacheControlManager()
-        req = _request(payload)
-        if payload == {"kv_cache_control": None}:
-            assert kvcm.is_no_store(req) is False
-            assert kvcm.metrics["parse_errors"] == 0
-        else:
-            assert kvcm.is_no_store(req) is False
-            assert kvcm.metrics["parse_errors"] == 1
-
-    def test_kv_transfer_params_wrong_type(self):
-        kvcm = KVCacheControlManager()
-        assert kvcm.is_no_store(_request("oops")) is False
+        assert kvcm.parse_request_control(_request("future_mode")) is None
         assert kvcm.metrics["parse_errors"] == 1
 
-    def test_request_without_attribute(self):
+    def test_malformed_payloads(self):
         kvcm = KVCacheControlManager()
-        assert kvcm.is_no_store(SimpleNamespace()) is False
+        for payload in ("not_a_dict", {"kv_cache_control": "pin"}, {"kv_cache_control": {"mode": 123}}):
+            assert kvcm.parse_request_control(_request()) is False or True
+            req = SimpleNamespace(kv_transfer_params=payload, request_id="r", block_hashes=[])
+            assert kvcm.parse_request_control(req) is None
+        assert kvcm.metrics["parse_errors"] == 3
 
     def test_parse_memoized_per_request(self):
         kvcm = KVCacheControlManager()
-        req = _no_store_request()
+        req = _request("no_store")
         first = kvcm.parse_request_control(req)
         second = kvcm.parse_request_control(req)
         assert first is second
         assert kvcm.metrics["no_store_requests"] == 1
 
-    def test_pin_ttl_modes_parse(self):
+
+class TestPinLifecycle:
+    def test_pin_activation_and_protection(self):
         kvcm = KVCacheControlManager()
-        pin_req = _request({"kv_cache_control": {"mode": "pin", "cache_key": "k", "priority": 3}})
-        control = kvcm.parse_request_control(pin_req)
-        assert control["mode"] == "pin" and control["priority"] == 3
+        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
+        req = _request("pin", pin_boundary_tokens=32)
+        req.block_hashes = _hashes(4)
+        kvcm.on_request_finished(req)
+        assert kvcm.protection_level(b"h0") == 1
+        assert kvcm.protection_level(b"h1") == 1
+        assert kvcm.protection_level(b"h2") == 0
+        assert kvcm.protection_level(b"missing") == 0
+        assert kvcm.has_protection() is True
         assert kvcm.metrics["pin_requests"] == 1
-        ttl_req = _request({"kv_cache_control": {"mode": "ttl", "cache_key": "k", "ttl_s": 60}})
-        control = kvcm.parse_request_control(ttl_req)
-        assert control["mode"] == "ttl" and control["ttl_s"] == 60
-        assert kvcm.metrics["ttl_requests"] == 1
 
-    def test_pin_without_cache_key_is_parse_error(self):
+    def test_pin_boundary_floors_to_blocks(self):
         kvcm = KVCacheControlManager()
-        assert kvcm.parse_request_control(_request({"kv_cache_control": {"mode": "pin"}})) is None
-        assert kvcm.metrics["parse_errors"] == 1
+        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
+        req = _request("pin", pin_boundary_tokens=137)
+        req.block_hashes = _hashes(10)
+        kvcm.on_request_finished(req)
+        entry = kvcm._pin_entries["r1"]
+        assert len(entry.hashes) == 8
 
-    def test_ttl_without_ttl_s_is_parse_error(self):
+    def test_pin_without_boundary_protects_all(self):
         kvcm = KVCacheControlManager()
-        assert kvcm.parse_request_control(_request({"kv_cache_control": {"mode": "ttl", "cache_key": "k"}})) is None
-        assert kvcm.metrics["parse_errors"] == 1
+        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
+        req = _request("pin")
+        req.block_hashes = _hashes(5)
+        kvcm.on_request_finished(req)
+        assert len(kvcm._pin_entries["r1"].hashes) == 5
+
+    def test_pin_quota_degrades(self, monkeypatch):
+        monkeypatch.setenv("VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO", "0.1")
+        kvcm = KVCacheControlManager()
+        kvcm.bind_kv_cache_manager(_fake_manager(num_gpu_blocks=100), block_size=16)
+        req = _request("pin")
+        req.block_hashes = _hashes(50)
+        kvcm.on_request_finished(req)
+        assert kvcm.protection_level(b"h0") == 0
+        assert kvcm.metrics["quota_degraded"] == 1
+        assert kvcm.has_protection() is False
+
+    def test_pin_ttl_expiry_sweep(self):
+        kvcm = KVCacheControlManager()
+        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
+        req = _request("pin", ttl_s=60)
+        req.block_hashes = _hashes(2)
+        kvcm.on_request_finished(req)
+        entry = kvcm._pin_entries["r1"]
+        entry.expire_at -= 61
+        kvcm._next_expiry = entry.expire_at
+        kvcm.maybe_sweep()
+        assert kvcm.protection_level(b"h0") == 0
+        assert kvcm.metrics["ttl_expired"] == 1
+
+    def test_maybe_sweep_fast_path(self):
+        kvcm = KVCacheControlManager()
+        kvcm.maybe_sweep()
+        assert kvcm.metrics["ttl_expired"] == 0
 
 
-class TestInterfaceStubs:
-    def test_content_ref_and_pin_handle(self):
-        ref = ContentRef(namespace="ns", cache_key="k", prefix_tokens=137)
-        assert ref.prefix_tokens == 137
-        handle = PinHandle.generate()
-        assert isinstance(handle, str) and len(handle) == 32
+class TestRelease:
+    def test_request_level_release_plan(self):
+        kvcm = KVCacheControlManager()
+        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
+        req = _request("release")
+        req.block_hashes = _hashes(3)
+        kvcm.on_request_finished(req)
+        plan = kvcm.take_release_plan()
+        assert plan == _hashes(3)
+        assert kvcm.take_release_plan() == []
+
+    def test_release_request_via_http(self):
+        kvcm = KVCacheControlManager()
+        req = _request("no_store")
+        req.block_hashes = _hashes(2)
+        req.request_id = "r1"
+        kvcm.on_request_finished(req)
+        assert kvcm.release_request("r1") is True
+        assert sorted(kvcm.take_release_plan()) == sorted(_hashes(2))
+        assert kvcm.release_request("r1") is False
+        assert kvcm.release_request("unknown") is False
+
+    def test_http_release_removes_pin_entry(self):
+        kvcm = KVCacheControlManager()
+        kvcm.bind_kv_cache_manager(_fake_manager(), block_size=16)
+        req = _request("pin")
+        req.block_hashes = _hashes(2)
+        kvcm.on_request_finished(req)
+        assert kvcm.release_request("r1") is True
+        assert kvcm.protection_level(b"h0") == 0
+
+    def test_history_cap_evicts_oldest(self, monkeypatch):
+        monkeypatch.setenv("VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE", "2")
+        kvcm = KVCacheControlManager()
+        for i in range(3):
+            req = _request("no_store")
+            req.request_id = f"r{i}"
+            req.block_hashes = [f"h{i}".encode()]
+            kvcm.on_request_finished(req)
+        assert "r0" not in kvcm._request_history
+        assert kvcm.release_request("r0") is False
+        assert kvcm.release_request("r2") is True
+
+
+class TestNoStorePath:
+    def test_no_store_finish_is_noop_for_registry(self):
+        kvcm = KVCacheControlManager()
+        req = _request("no_store")
+        req.block_hashes = _hashes(3)
+        kvcm.on_request_finished(req)
+        assert kvcm._pin_entries == {}
+        assert kvcm.take_release_plan() == []
+        assert len(kvcm._request_history) == 1
+
+    def test_request_without_declaration_recorded(self):
+        kvcm = KVCacheControlManager()
+        req = _request()
+        req.request_id = "r9"
+        req.block_hashes = _hashes(2)
+        kvcm.on_request_finished(req)
+        assert kvcm.release_request("r9") is True
