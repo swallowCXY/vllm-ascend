@@ -967,6 +967,8 @@ curl -s -X POST http://127.0.0.1:8000/kv_cache/flush -H "Content-Type: applicati
 
 ## 18. 需求收敛后的最终形态（v2，message 级声明）
 
+> 分支基线：v0.25.1rc1（vLLM 0.25.1）。14 个上游锚点在 v0.25.1 上逐一预验证存活（allocate_slots 位置参数序、cache_blocks/free/evict_blocks/get_new_blocks/UTILITY 反射/serving 注入时序等）；v0.23.0 基线的实现与实测记录见 §15–§17（历史存档）。
+
 本章记录 2026-09 需求评审后的最终设计，**覆盖 §17 中与之冲突的部分**（§15/§16 no-store 机制不变）。
 
 ### 18.1 需求决策记录

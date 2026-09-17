@@ -1,8 +1,9 @@
 # KV Cache 生命周期控制 — 验收规格书
 
-> 版本：v2.0（对应分支 `feat/kv-cache-control`，message 级声明形态）
+> 版本：v2.1（分支 `feat/kv-cache-control-v0.25.1rc1`，基线 vllm-ascend **v0.25.1rc1** / vLLM 0.25.1）
 > 用途：与需求方确认功能范围、调用方式、验收标准与功能边界。
 > 配套设计文档：`KV_Cache_Control_Manager.md`（§18 为本轮需求收敛后的最终实现记录）。
+> 注：v0.23.0 基线的实测记录（设计文档 §16.5）为历史存档；本分支锚点已针对 vLLM 0.25.1 重新验证。
 
 ## 1. 范围与功能状态
 
