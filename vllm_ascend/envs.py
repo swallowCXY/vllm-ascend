@@ -107,11 +107,18 @@ env_variables: dict[str, Callable[[], Any]] = {
     # KV pool stores. Requests without the declaration are unaffected.
     # 0: disable; 1: enable (default).
     "VLLM_ASCEND_KV_CACHE_CONTROL": lambda: bool(int(os.getenv("VLLM_ASCEND_KV_CACHE_CONTROL", "1"))),
-    # Upper bound of prefix-cache blocks protected by pin / unexpired TTL
-    # entries, as a fraction of total GPU KV blocks. Declarations exceeding
-    # the budget degrade to normal caching with a warning.
+    # Upper bound of prefix-cache blocks protected by pin entries, as a
+    # fraction of total GPU KV blocks. Pins exceeding the budget are not
+    # activated (content degrades to normal caching with a warning).
     # Valid range: (0, 1); default 0.25.
     "VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO": lambda: float(os.getenv("VLLM_ASCEND_KVCC_PIN_BUDGET_RATIO", "0.25")),
+    # Default TTL (seconds) for message-level pin declarations that do not
+    # carry an explicit ttl_s. Default 3600 (1 hour).
+    "VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S": lambda: float(os.getenv("VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S", "3600")),
+    # Capacity of the finished-request hash table used by the out-of-band
+    # /kv_cache/release route. Oldest entries are dropped beyond the cap.
+    # Default 4096.
+    "VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE": lambda: int(os.getenv("VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE", "4096")),
 }
 
 # end-env-vars-definition

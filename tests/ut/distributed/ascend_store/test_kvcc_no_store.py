@@ -20,9 +20,6 @@ from unittest.mock import MagicMock
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
 from vllm_ascend.core.kv_cache_control_manager import KVCacheControlManager
-from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.ascend_store_connector import (
-    AscendStoreConnector,
-)
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler import (
     KVPoolScheduler,
 )
@@ -131,63 +128,3 @@ class TestBuildConnectorMetaNoStore:
         output.scheduled_cached_reqs = SimpleNamespace(req_ids=["unknown"], new_block_ids=[[1]])
         scheduler.build_connector_meta(output)
         scheduler._process_running_cached_request.assert_called_once()
-
-
-class TestExternalDelete:
-    def test_queue_and_attach_delete_keys(self):
-        scheduler = _scheduler()
-        scheduler.queue_external_delete([b"\xaa\xbb", b"\xcc\xdd"])
-        output = SimpleNamespace(
-            finished_req_ids=set(),
-            preempted_req_ids=set(),
-            scheduled_new_reqs=[],
-            scheduled_cached_reqs=SimpleNamespace(req_ids=[], new_block_ids=[]),
-        )
-        meta = scheduler.build_connector_meta(output)
-        assert meta.delete_keys == ["test-model@aabb", "test-model@ccdd"]
-        meta2 = scheduler.build_connector_meta(output)
-        assert meta2.delete_keys is None
-
-    def test_connector_delegates_to_scheduler(self):
-        scheduler = _scheduler()
-        connector = SimpleNamespace(connector_scheduler=scheduler)
-        AscendStoreConnector.queue_external_delete(connector, [b"\xcc"])
-        assert scheduler._pending_delete_keys == ["cc"]
-
-    def test_worker_consumes_delete_keys(self):
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
-            KVPoolWorker,
-        )
-
-        worker = object.__new__(KVPoolWorker)
-        worker.m_store = MagicMock()
-        worker.kv_send_thread = None
-        worker.kv_recv_thread = None
-        worker.tp_rank = 0
-        meta = SimpleNamespace(
-            delete_keys=["m@aa"],
-            preempted_req_ids=set(),
-            loading_req_ids=set(),
-            delayed_free_req_ids=set(),
-        )
-        done_sending, done_recving = KVPoolWorker.get_finished(worker, set(), meta)
-        worker.m_store.batch_remove_lease.assert_called_once_with(["m@aa"])
-        assert done_sending == set() and done_recving == set()
-
-    def test_worker_skips_unsupported_backend(self):
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_worker import (
-            KVPoolWorker,
-        )
-
-        worker = object.__new__(KVPoolWorker)
-        worker.m_store = SimpleNamespace()
-        worker.kv_send_thread = None
-        worker.kv_recv_thread = None
-        worker.tp_rank = 0
-        meta = SimpleNamespace(
-            delete_keys=["m@aa"],
-            preempted_req_ids=set(),
-            loading_req_ids=set(),
-            delayed_free_req_ids=set(),
-        )
-        KVPoolWorker.get_finished(worker, set(), meta)

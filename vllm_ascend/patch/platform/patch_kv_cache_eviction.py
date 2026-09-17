@@ -14,14 +14,16 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""Eviction-time protection filter for pinned / TTL KV cache entries.
+"""Hard eviction protection for pinned KV cache entries.
 
-Wraps ``BlockPool.get_new_blocks``: when the free queue front holds blocks
-protected by ``KVCacheControlManager`` entries (pin / unexpired TTL), those
-blocks are skipped and re-appended to the queue tail (LRU refresh), and
-unprotected blocks are taken instead. Soft-pin invariant: if the whole queue
-is protected, the coldest protected blocks (queue order) are sacrificed so
-that allocation is never blocked by protection.
+Wraps ``BlockPool.get_new_blocks``: blocks protected by an unexpired pin are
+never handed out as victims. When the free queue cannot satisfy the request
+without touching protected blocks, the skipped blocks are re-queued and
+``PinProtectedExhaustedError`` is raised; the ``allocate_slots`` wrapper in
+``patch_kv_cache_control`` converts it into an allocation failure (``None``)
+so the scheduler takes its normal preemption path. Hard pins are therefore
+never evicted, at the cost of reduced capacity for normal traffic once the
+pin budget is consumed.
 """
 
 from functools import wraps
@@ -32,6 +34,7 @@ from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_utils import get_block_hash
 
 from vllm_ascend import envs
+from vllm_ascend.core.kv_cache_control_manager import PinProtectedExhaustedError
 
 _PATCH_MARKER = "__vcc_eviction_filter_patched__"
 
@@ -47,34 +50,38 @@ def _apply_patch() -> None:
     @wraps(original)
     def _patched_get_new_blocks(self: BlockPool, num_blocks: int) -> list[Any]:
         kvcm = getattr(self, "kv_cache_control_manager", None)
-        if kvcm is None or not kvcm.has_protection() or num_blocks > self.get_num_free_blocks():
+        if kvcm is None or not kvcm.has_protection():
             return original(self, num_blocks)
 
-        collected: list[Any] = []
-        skipped: list[Any] = []
         queue = self.free_block_queue
         remaining = self.get_num_free_blocks()
-        while len(collected) < num_blocks and remaining > 0:
+        popped: list[tuple[Any, bool]] = []
+        unprotected_count = 0
+        while unprotected_count < num_blocks and remaining > 0:
             block = queue.popleft()
             remaining -= 1
             level = 0
             if block.block_hash is not None:
                 level = kvcm.protection_level(get_block_hash(block.block_hash))
-            if level > 0:
-                skipped.append(block)
-            else:
-                collected.append(block)
+            protected = level > 0
+            popped.append((block, protected))
+            if not protected:
+                unprotected_count += 1
+
+        collected = [block for block, protected in popped if not protected]
         if len(collected) < num_blocks:
-            # Soft-pin fallback: sacrifice the coldest protected blocks (queue
-            # order) so that allocation is never blocked by protection.
-            fallback = num_blocks - len(collected)
-            collected.extend(skipped[:fallback])
-            skipped = skipped[fallback:]
-            kvcm.metrics["pin_evictions"] += fallback
+            # Hard protection: never hand out protected blocks. Restore the
+            # queue in its original order and fail this allocation; the
+            # allocate_slots wrapper maps this to None so the scheduler
+            # preempts normally.
+            queue.append_n([block for block, _ in popped])
             logger.debug(
-                "KV cache protection fallback: evicted %d protected blocks under pressure",
-                fallback,
+                "KV cache protection exhausted: %d unprotected free blocks, allocation of %d fails",
+                len(collected),
+                num_blocks,
             )
+            raise PinProtectedExhaustedError(f"only {len(collected)}/{num_blocks} unprotected free blocks available")
+        skipped = [block for block, protected in popped if protected]
         if skipped:
             queue.append_n(skipped)
 
@@ -89,7 +96,7 @@ def _apply_patch() -> None:
 
     _patched_get_new_blocks.__vcc_eviction_filter_patched__ = True  # type: ignore[attr-defined]
     BlockPool.get_new_blocks = _patched_get_new_blocks
-    logger.info("KV cache control enabled: eviction protection filter applied")
+    logger.info("KV cache control enabled: hard eviction protection applied")
 
 
 _apply_patch()

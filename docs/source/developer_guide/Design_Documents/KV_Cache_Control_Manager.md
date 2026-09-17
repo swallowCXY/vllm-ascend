@@ -964,3 +964,46 @@ curl -s -X POST http://127.0.0.1:8000/kv_cache/flush -H "Content-Type: applicati
 3. 兜底牺牲保护块按队列顺序（LRU），未按 priority 细排；`pin_evictions` 指标可观测。
 4. DP 场景控制面扇出与 `reset_prefix_cache` 同链路，多 DP 行为需容器专项确认。
 5. 上游锚点：`BlockPool.get_new_blocks`/`evict_blocks`/`KVCacheManager.free`/`EngineCore` 反射，升级需复核。
+
+## 18. 需求收敛后的最终形态（v2，message 级声明）
+
+本章记录 2026-09 需求评审后的最终设计，**覆盖 §17 中与之冲突的部分**（§15/§16 no-store 机制不变）。
+
+### 18.1 需求决策记录
+
+| # | 决策 |
+| --- | --- |
+| 1 | pin/ttl 合一：pin 必有 TTL，缺省 `VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S`（3600s），显式 `ttl_s` 覆盖 |
+| 2 | pin 声明放 message 内：`{"role":..., "content":..., "kv_cache_control": {...}}`；一条请求最多一个 pin message |
+| 3 | pin 范围 = tools + messages[0..k]（**含声明消息**），尾部按块截断 |
+| 4 | pin **硬性不淘汰**（删除软兜底）；配额超限新 pin 不激活、正常推理、日志提示；取消 pin 引用计数与 PinHandle |
+| 5 | release 针对整个请求（sub agent 收尾场景），**全删语义**：注销该请求哈希覆盖的全部注册（含共享未 pin 前缀）；release 请求不得包含 pin message |
+| 6 | no_store 针对整个请求（P0 机制不变）；与 pin 互斥 |
+| 7 | 三 mode 互斥：混合出现全部不生效 + 返回提示（a+c：非流式响应字段 + 日志；流式仅日志） |
+| 8 | 控制面只保留 `POST /kv_cache/release`（按 request_id）；pin/ttl/flush 不可会话后修改；无预检查询方法 |
+| 9 | 不考虑 external store：tier/外部删除链路全部回退 |
+
+### 18.2 实现清单（相对 §17 的增量）
+
+| 文件 | 变更 |
+| --- | --- |
+| `core/kv_cache_control_manager.py` | 重写：`request_id → PinEntry{hashes, expire_at}` 注册表 + `hash→entries` 反查；`on_request_finished`（pin 激活含配额硬判定 / release 出队计划 / 请求历史表）；`release_request`；`protection_level`（0/1）；删除 handle/pin_count/set_ttl/flush/tier/ContentRef |
+| `core/kv_cache_evict_utils.py`（新） | `evict_hashes(manager, hashes)`：跨 group 哈希→块解析 + 上游 `evict_blocks`，供两处调用 |
+| `patch/platform/patch_kv_cache_control.py` | free wrapper 执行 release 计划；allocate wrapper 捕获 `PinProtectedExhaustedError` → 返回 None（走上游抢占路径） |
+| `patch/platform/patch_kv_cache_eviction.py` | 软兜底删除：保护块耗尽时按原序恢复队列并抛 `PinProtectedExhaustedError`——硬保护永不破坏 |
+| `patch/platform/patch_kv_cache_control_engine.py` | 仅 `kv_cache_release(request_id)`；删除 pin/set_ttl/flush；新增 chat serving patch（render 前注入 + 非流式响应附加 status） |
+| `entrypoints/kv_cache_router.py` | 仅 `POST /kv_cache/release {"request_id"}` |
+| `entrypoints/kv_cache_message.py`（新） | message 提取（dict/pydantic 双路径）→ 互斥裁决（conflict_modes/multiple_pin_messages/invalid_declaration）→ 增量渲染边界 + 前缀单调校验（含 tools）→ 注入 `kv_transfer_params`（`pin_boundary_tokens`/ttl_s）→ status 暂存 |
+| `ascend_store` 四文件 | 回退外部删除（delete_keys/queue_external_delete/_pop_delete_keys/worker 消费） |
+| `envs.py` | 新增 `VLLM_ASCEND_KVCC_DEFAULT_PIN_TTL_S`（3600）、`VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE`（4096） |
+
+### 18.3 关键机制
+
+- **pin 边界计算**（serving 层）：对声明消息 k，增量渲染 `messages[:k+1]`（含 tools 与模板参数）→ 前缀单调校验（prefix string 必须是 full string 的前缀，否则声明不生效 + `boundary_render_failed` 提示）→ boundary_tokens 传引擎 → 按 block_size floor 取哈希前缀。
+- **release 全删**：finish 时 plan = 请求全部 block_hashes → `evict_hashes` 注销（含共享未 pin 前缀；被覆盖的他人 pin 条目残留但失去保护对象，同内容重算注册后原 TTL 内再次受保护）。
+- **硬保护与抢占**：`get_new_blocks` walk 跳过保护块；无法满足时按原序恢复队列并抛 `PinProtectedExhaustedError`，allocate wrapper 转 None → 上游 preemption。极端压力下非 pin 流量可用容量压缩至配额外部分（已确认接受）。
+- **请求历史表**：finish 请求的 request_id → hashes，容量 FIFO 淘汰（`VLLM_ASCEND_KVCC_RELEASE_TABLE_SIZE`），支撑会话后 HTTP release。
+
+### 18.4 测试与本地验证
+
+83 个 UT 全部通过（无 torch/vllm 环境）：核心 20、wrapper 12、驱逐过滤 6、控制面 8、消息级 18、ascend_store 9；ascend_store 回归 183 passed；ruff 通过。容器验收按《验收规格书》§4（v2.0）执行。

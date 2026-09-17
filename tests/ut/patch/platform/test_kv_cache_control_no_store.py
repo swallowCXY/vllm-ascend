@@ -44,7 +44,7 @@ _FAKE_MODULES = (
     "vllm_ascend.patch.platform",
 )
 
-_calls = {"allocate": [], "cache_blocks": [], "free": []}
+_calls = {"allocate": [], "cache_blocks": [], "free": [], "evict": []}
 
 
 class _FakeKVCacheManager:
@@ -71,9 +71,17 @@ def _no_store_request():
 
 def _pin_request():
     return SimpleNamespace(
-        kv_transfer_params={"kv_cache_control": {"mode": "pin", "cache_key": "k"}},
+        kv_transfer_params={"kv_cache_control": {"mode": "pin", "ttl_s": 60, "pin_boundary_tokens": 128}},
         request_id="r3",
         block_hashes=[b"h0", b"h1"],
+    )
+
+
+def _release_request():
+    return SimpleNamespace(
+        kv_transfer_params={"kv_cache_control": {"mode": "release"}},
+        request_id="r4",
+        block_hashes=[b"r0", b"r1"],
     )
 
 
@@ -92,6 +100,7 @@ def patched_module(monkeypatch):
     _calls["allocate"].clear()
     _calls["cache_blocks"].clear()
     _calls["free"].clear()
+    _calls["evict"].clear()
 
     saved = {name: sys.modules.get(name) for name in _FAKE_MODULES}
 
@@ -135,6 +144,7 @@ def patched_module(monkeypatch):
         mod = importlib.util.module_from_spec(spec)
         sys.modules[_PATCH_MODULE] = mod
         spec.loader.exec_module(mod)
+        mod.evict_hashes = MagicMock(side_effect=lambda manager, hashes: _calls["evict"].append(list(hashes)))
         yield mod
     finally:
         for name, original in saved.items():
@@ -194,14 +204,25 @@ class TestNoStorePatch:
         manager = _make_manager()
         manager.free(_pin_request())
         assert _calls["free"] == ["r3"]
-        assert len(manager.kv_cache_control_manager._entries) == 1
+        entry = manager.kv_cache_control_manager._pin_entries["r3"]
+        assert len(entry.hashes) == 2
         assert manager.kv_cache_control_manager.protection_level(b"h0") == 1
+        assert manager.kv_cache_control_manager.protection_level(b"h1") == 1
+        assert manager.kv_cache_control_manager.metrics["pin_requests"] == 1
+
+    def test_free_release_evicts_registrations(self, patched_module):
+        manager = _make_manager()
+        manager.free(_release_request())
+        assert _calls["free"] == ["r4"]
+        assert _calls["evict"] == [[b"r0", b"r1"]]
+        assert manager.kv_cache_control_manager._pin_entries == {}
 
     def test_free_without_declaration_noop(self, patched_module):
         manager = _make_manager()
         manager.free(_normal_request())
         assert _calls["free"] == ["r2"]
-        assert manager.kv_cache_control_manager._entries == {}
+        assert _calls["evict"] == []
+        assert manager.kv_cache_control_manager._pin_entries == {}
 
     def test_patch_is_idempotent(self, patched_module):
         first = _FakeKVCacheManager.allocate_slots

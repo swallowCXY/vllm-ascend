@@ -26,7 +26,10 @@ from types import SimpleNamespace
 import pytest
 
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
-from vllm_ascend.core.kv_cache_control_manager import KVCacheControlManager
+from vllm_ascend.core.kv_cache_control_manager import (
+    KVCacheControlManager,
+    PinProtectedExhaustedError,
+)
 
 _PATCH_MODULE = "vllm_ascend.patch.platform.patch_kv_cache_eviction"
 _PATCH_FILE = Path(__file__).resolve().parents[4] / "vllm_ascend/patch/platform/patch_kv_cache_eviction.py"
@@ -92,11 +95,11 @@ def _block(block_id, block_hash=None, protected=False):
     )
 
 
-def _kvcm_with_entry(key, num_hashes, priority=0):
+def _kvcm_with_entry(request_id, num_hashes):
     kvcm = KVCacheControlManager()
     req = SimpleNamespace(
-        kv_transfer_params={"kv_cache_control": {"mode": "pin", "cache_key": key, "priority": priority}},
-        request_id=f"req-{key}",
+        kv_transfer_params={"kv_cache_control": {"mode": "pin"}},
+        request_id=request_id,
         block_hashes=[f"h{i}".encode() for i in range(num_hashes)],
     )
     kvcm.on_request_finished(req)
@@ -176,28 +179,22 @@ class TestEvictionFilter:
         out = pool.get_new_blocks(3)
         assert [b.block_id for b in out] == [0, 1, 2]
 
-    def test_all_protected_fallback_sacrifices_coldest(self, patched_module):
+    def test_all_protected_raises_and_restores_queue(self, patched_module):
         kvcm = _kvcm_with_entry("k", 2)
         blocks = [_block(0, b"h0"), _block(1, b"h1")]
         pool = _FakeBlockPool(blocks, kvcm)
-        out = pool.get_new_blocks(2)
-        assert [b.block_id for b in out] == [0, 1]
-        assert kvcm.metrics["pin_evictions"] == 2
+        with pytest.raises(PinProtectedExhaustedError):
+            pool.get_new_blocks(2)
+        assert [b.block_id for b in pool.free_block_queue.blocks] == [0, 1]
+        assert all(not b.evicted for b in pool.free_block_queue.blocks)
 
-    def test_fallback_takes_queue_order_not_priority(self, patched_module):
-        kvcm_high = _kvcm_with_entry("high", 1, priority=9)
-        req = SimpleNamespace(
-            kv_transfer_params={"kv_cache_control": {"mode": "pin", "cache_key": "low", "priority": 1}},
-            request_id="req-low",
-            block_hashes=[b"h1"],
-        )
-        kvcm_high.on_request_finished(req)
+    def test_partial_protection_exhaustion_raises_and_restores(self, patched_module):
+        kvcm = _kvcm_with_entry("k", 2)
         blocks = [_block(0, b"h0"), _block(1, b"h1"), _block(2, b"u2")]
-        pool = _FakeBlockPool(blocks, kvcm_high)
-        out = pool.get_new_blocks(2)
-        assert [b.block_id for b in out] == [2, 0]
-        assert kvcm_high.metrics["pin_evictions"] == 1
-        assert [b.block_id for b in pool.free_block_queue.blocks] == [1]
+        pool = _FakeBlockPool(blocks, kvcm)
+        with pytest.raises(PinProtectedExhaustedError):
+            pool.get_new_blocks(3)
+        assert [b.block_id for b in pool.free_block_queue.blocks] == [0, 1, 2]
 
     def test_insufficient_free_raises(self, patched_module):
         blocks = [_block(0, b"h0")]
