@@ -19,6 +19,7 @@ import asyncio
 import importlib.util
 import sys
 import types
+from collections import UserDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -58,6 +59,17 @@ class _FakeTokenizer:
         return [0] * int(len(text) * self.tokens_per_char)
 
 
+class _BatchEncodingTokenizer(_FakeTokenizer):
+    """transformers v5 returns a BatchEncoding (dict-like, not dict) for
+    ``tokenize=True``; its ``len`` is the number of keys, not the token count."""
+
+    def apply_chat_template(self, conversation, tokenize=False, **kwargs):
+        if not tokenize:
+            return super().apply_chat_template(conversation, tokenize=False, **kwargs)
+        ids = super().apply_chat_template(conversation, tokenize=True, **kwargs)
+        return UserDict({"input_ids": ids, "attention_mask": [1] * len(ids)})
+
+
 def _serving(monotonic=True):
     return SimpleNamespace(
         renderer=SimpleNamespace(tokenizer=_FakeTokenizer(monotonic)),
@@ -86,6 +98,34 @@ class TestAggregation:
         serving = _serving()
         request = _request([_msg("user", "x" * 40, {"mode": "pin"})], tools=[{"name": "t"}])
         assert kcm.aggregate_message_controls(serving, request)["mode"] == "pin"
+
+    def test_pin_boundary_extracts_input_ids_from_batch_encoding(self):
+        serving = SimpleNamespace(
+            renderer=SimpleNamespace(tokenizer=_BatchEncodingTokenizer()),
+            chat_template=None,
+            default_chat_template_kwargs={},
+        )
+        request = _request([_msg("system", "sys"), _msg("user", "x" * 40, {"mode": "pin"})])
+        directive = kcm.aggregate_message_controls(serving, request)
+        assert directive["pin_boundary_tokens"] == int(43 * 0.25)
+
+    def test_tools_normalized_to_dicts_for_rendering(self):
+        captured = {}
+
+        class _ToolTokenizer(_FakeTokenizer):
+            def apply_chat_template(self, conversation, tokenize=False, **kwargs):
+                captured["tools"] = kwargs.get("tools")
+                return super().apply_chat_template(conversation, tokenize=tokenize, **kwargs)
+
+        serving = SimpleNamespace(
+            renderer=SimpleNamespace(tokenizer=_ToolTokenizer()),
+            chat_template=None,
+            default_chat_template_kwargs={},
+        )
+        tool_obj = SimpleNamespace(model_dump=lambda: {"type": "function", "function": {"name": "t"}})
+        request = _request([_msg("user", "x" * 40, {"mode": "pin"})], tools=[tool_obj])
+        assert kcm.aggregate_message_controls(serving, request)["mode"] == "pin"
+        assert captured["tools"] == [{"type": "function", "function": {"name": "t"}}]
 
     def test_no_store_any_message_request_wide(self):
         serving = _serving()

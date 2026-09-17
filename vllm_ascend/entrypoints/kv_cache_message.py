@@ -133,6 +133,16 @@ def _stash_status(request: Any, status: str, reason: str, detail: Any = None) ->
     logger.info("KV cache control declaration %s: %s", status, payload)
 
 
+def _as_tool_dict(tool: Any) -> Any:
+    """Return a chat-template-friendly tool form (mirrors vLLM's render)."""
+    if isinstance(tool, dict):
+        return tool
+    model_dump = getattr(tool, "model_dump", None)
+    if callable(model_dump):
+        return model_dump()
+    return tool
+
+
 def _render_conversation(serving: Any, request: Any, conversation: list[Any], tokenize: bool) -> Any:
     """Render a conversation prefix with the serving chat template + tools."""
     tokenizer = serving.renderer.tokenizer
@@ -143,7 +153,11 @@ def _render_conversation(serving: Any, request: Any, conversation: list[Any], to
         kwargs["chat_template"] = serving.chat_template
     tools = getattr(request, "tools", None)
     if tools:
-        kwargs["tools"] = tools
+        # vLLM passes ``tool.model_dump()`` dicts to the chat template;
+        # transformers rejects raw pydantic tool objects, so normalize to the
+        # same dict form the real render uses (keeps the computed boundary in
+        # sync with the actual tokenization).
+        kwargs["tools"] = [_as_tool_dict(tool) for tool in tools]
     merged_kwargs = dict(getattr(serving, "default_chat_template_kwargs", {}) or {})
     request_kwargs = getattr(request, "chat_template_kwargs", None) or {}
     merged_kwargs.update(request_kwargs)
@@ -171,7 +185,10 @@ def _pin_boundary_tokens(serving: Any, request: Any, pin_index: int) -> int | No
             logger.warning("Chat template is not prefix-monotonic; message-level pin rejected for request")
             return None
         prefix_ids = _render_conversation(serving, request, messages[: pin_index + 1], tokenize=True)
-        if isinstance(prefix_ids, dict):
+        if hasattr(prefix_ids, "get"):
+            # dict or transformers v5 BatchEncoding (tokenize=True returns a
+            # BatchEncoding by default, whose len is the number of keys rather
+            # than the token count).
             prefix_ids = prefix_ids.get("input_ids")
         return len(prefix_ids)
     except Exception:
