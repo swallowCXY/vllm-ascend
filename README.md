@@ -1,3 +1,27 @@
+Agent 请求（HTTP body 原样到达 serving 层）
+  messages: [
+    {system...},
+    {user, "知识库",  kv_cache_control: {"mode":"pin", "ttl_s":7200}},
+    {user, "一次性问题", kv_cache_control: {"mode":"no_store"}}
+  ]
+        │
+        ▼  serving 层（kv_cache_message.py，挂在 render_chat_request 前）
+  ① 提取两条声明 → 裁决：{pin, no_store} 合法组合
+  ② 增量渲染算出 pin 边界 N（tools + messages[0..k] 的 token 数）
+  ③ 聚合为【一条】引擎指令，写入 request.kv_transfer_params：
+        {"mode": "pin", "ttl_s": 7200,
+         "pin_boundary_tokens": N,      ← 保护边界（已有机制）
+         "cache_boundary_tokens": N}    ← 缓存边界（本次新增）
+        │
+        ▼  走上游原生通道（to_sampling_params → extra_args → Request.kv_transfer_params，零改动）
+  EngineCore / Scheduler（KCCM 在这里解析）
+     ├─ pin_boundary_tokens=N：请求完成时激活硬保护 [0..N)     （已有，零改动）
+     └─ cache_boundary_tokens=N：调度期间只注册前 N token 的块  （新增，A2 wrapper 钳制）
+三个要点：
+1. 引擎看不到 no_store 这个 mode——组合在 serving 层就被“翻译”掉了。引擎视角里这就是一个带缓存边界的 pin 请求，mode 字段只有 pin/no_store/release 三种（分别对应：单独 pin、单独 no-store、release），组合不新增 mode 枚举值。
+2. 两个字段各司其职：pin_boundary_tokens=N 管“finish 时保护哪些块”（已有）；cache_boundary_tokens=N 管“调度过程中注册哪些块”（新增钳制）。combo 场景下两者数值相同，但语义独立。
+3. 原始 messages 上的 kv_cache_control 字段只被 serving 层消费一次（openai 协议的 extra="allow" 保证它通过校验并保留），chat template 渲染会忽略它，不影响 token 内容。
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm-ascend/main/docs/source/logos/vllm-ascend-logo-text-dark.png">
